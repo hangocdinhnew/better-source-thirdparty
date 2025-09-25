@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2021 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -18,11 +18,14 @@
      misrepresented as being the original software.
   3. This notice may not be removed or altered from any source distribution.
 */
-#include "SDL_internal.h"
+#include "../../SDL_internal.h"
 
-#ifdef SDL_VIDEO_DRIVER_UIKIT
+#if SDL_VIDEO_DRIVER_UIKIT
 
 #include "../SDL_sysvideo.h"
+#include "SDL_hints.h"
+#include "SDL_system.h"
+#include "SDL_main.h"
 
 #import "SDL_uikitappdelegate.h"
 #import "SDL_uikitmodes.h"
@@ -39,51 +42,55 @@ static int forward_argc;
 static char **forward_argv;
 static int exit_status;
 
-int SDL_RunApp(int argc, char* argv[], SDL_main_func mainFunction, void * reserved)
+int SDL_UIKitRunApp(int argc, char *argv[], SDL_main_func mainFunction)
 {
     int i;
 
-    // store arguments
-    /* Note that we need to be careful about how we allocate/free memory here.
-     * If the application calls SDL_SetMemoryFunctions(), we can't rely on
-     * SDL_free() to use the same allocator after SDL_main() returns.
-     */
+    /* store arguments */
     forward_main = mainFunction;
     forward_argc = argc;
-    forward_argv = (char **)malloc((argc + 1) * sizeof(char *)); // This should NOT be SDL_malloc()
+    forward_argv = (char **)malloc((argc+1) * sizeof(char *));
     for (i = 0; i < argc; i++) {
-        forward_argv[i] = malloc((strlen(argv[i]) + 1) * sizeof(char)); // This should NOT be SDL_malloc()
+        forward_argv[i] = malloc( (strlen(argv[i])+1) * sizeof(char));
         strcpy(forward_argv[i], argv[i]);
     }
     forward_argv[i] = NULL;
 
-    // Give over control to run loop, SDLUIKitDelegate will handle most things from here
+    /* Give over control to run loop, SDLUIKitDelegate will handle most things from here */
     @autoreleasepool {
         UIApplicationMain(argc, argv, nil, [SDLUIKitDelegate getAppDelegateClassName]);
     }
 
-    // free the memory we used to hold copies of argc and argv
+    /* free the memory we used to hold copies of argc and argv */
     for (i = 0; i < forward_argc; i++) {
-        free(forward_argv[i]); // This should NOT be SDL_free()
+        free(forward_argv[i]);
     }
-    free(forward_argv); // This should NOT be SDL_free()
+    free(forward_argv);
 
     return exit_status;
 }
 
-#if !defined(SDL_PLATFORM_TVOS) && !defined(SDL_PLATFORM_VISIONOS)
-// Load a launch image using the old UILaunchImageFile-era naming rules.
-static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
+static void SDLCALL
+SDL_IdleTimerDisabledChanged(void *userdata, const char *name, const char *oldValue, const char *hint)
+{
+    BOOL disable = (hint && *hint != '0');
+    [UIApplication sharedApplication].idleTimerDisabled = disable;
+}
+
+#if !TARGET_OS_TV
+/* Load a launch image using the old UILaunchImageFile-era naming rules. */
+static UIImage *
+SDL_LoadLaunchImageNamed(NSString *name, int screenh)
 {
     UIInterfaceOrientation curorient = [UIApplication sharedApplication].statusBarOrientation;
     UIUserInterfaceIdiom idiom = [UIDevice currentDevice].userInterfaceIdiom;
     UIImage *image = nil;
 
     if (idiom == UIUserInterfaceIdiomPhone && screenh == 568) {
-        // The image name for the iPhone 5 uses its height as a suffix.
+        /* The image name for the iPhone 5 uses its height as a suffix. */
         image = [UIImage imageNamed:[NSString stringWithFormat:@"%@-568h", name]];
     } else if (idiom == UIUserInterfaceIdiomPad) {
-        // iPad apps can launch in any orientation.
+        /* iPad apps can launch in any orientation. */
         if (UIInterfaceOrientationIsLandscape(curorient)) {
             if (curorient == UIInterfaceOrientationLandscapeLeft) {
                 image = [UIImage imageNamed:[NSString stringWithFormat:@"%@-LandscapeLeft", name]];
@@ -109,62 +116,11 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
 
     return image;
 }
-
-@interface SDLLaunchStoryboardViewController : UIViewController
-@property(nonatomic, strong) UIViewController *storyboardViewController;
-- (instancetype)initWithStoryboardViewController:(UIViewController *)storyboardViewController;
-@end
-
-@implementation SDLLaunchStoryboardViewController
-
-- (instancetype)initWithStoryboardViewController:(UIViewController *)storyboardViewController
-{
-    self = [super init];
-    self.storyboardViewController = storyboardViewController;
-    return self;
-}
-
-- (void)viewDidLoad
-{
-    [super viewDidLoad];
-
-    [self addChildViewController:self.storyboardViewController];
-    [self.view addSubview:self.storyboardViewController.view];
-    self.storyboardViewController.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.storyboardViewController.view.frame = self.view.bounds;
-    [self.storyboardViewController didMoveToParentViewController:self];
-
-#ifndef SDL_PLATFORM_VISIONOS
-    UIApplication.sharedApplication.statusBarHidden = self.prefersStatusBarHidden;
-    UIApplication.sharedApplication.statusBarStyle = self.preferredStatusBarStyle;
-#endif
-}
-
-- (BOOL)prefersStatusBarHidden
-{
-    return [[NSBundle.mainBundle objectForInfoDictionaryKey:@"UIStatusBarHidden"] boolValue];
-}
-
-- (UIStatusBarStyle)preferredStatusBarStyle
-{
-    NSString *statusBarStyle = [NSBundle.mainBundle objectForInfoDictionaryKey:@"UIStatusBarStyle"];
-    if ([statusBarStyle isEqualToString:@"UIStatusBarStyleLightContent"]) {
-        return UIStatusBarStyleLightContent;
-    }
-    if (@available(iOS 13.0, *)) {
-        if ([statusBarStyle isEqualToString:@"UIStatusBarStyleDarkContent"]) {
-            return UIStatusBarStyleDarkContent;
-        }
-    }
-    return UIStatusBarStyleDefault;
-}
-
-@end
-#endif // !SDL_PLATFORM_TVOS
+#endif /* !TARGET_OS_TV */
 
 @interface SDLLaunchScreenController ()
 
-#ifndef SDL_PLATFORM_TVOS
+#if !TARGET_OS_TV
 - (NSUInteger)supportedInterfaceOrientations;
 #endif
 
@@ -185,9 +141,10 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
 
     NSString *screenname = nibNameOrNil;
     NSBundle *bundle = nibBundleOrNil;
+    BOOL atleastiOS8 = UIKit_IsSystemVersionAtLeast(8.0);
 
-    // A launch screen may not exist. Fall back to launch images in that case.
-    if (screenname) {
+    /* Launch screens were added in iOS 8. Otherwise we use launch images. */
+    if (screenname && atleastiOS8) {
         @try {
             self.view = [bundle loadNibNamed:screenname owner:self options:nil][0];
         }
@@ -203,20 +160,13 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
         NSString *imagename = nil;
         UIImage *image = nil;
 
-#ifdef SDL_PLATFORM_VISIONOS
-        int screenw = SDL_XR_SCREENWIDTH;
-        int screenh = SDL_XR_SCREENHEIGHT;
-#else
         int screenw = (int)([UIScreen mainScreen].bounds.size.width + 0.5);
         int screenh = (int)([UIScreen mainScreen].bounds.size.height + 0.5);
-#endif
 
-
-
-#if !defined(SDL_PLATFORM_TVOS) && !defined(SDL_PLATFORM_VISIONOS)
+#if !TARGET_OS_TV
         UIInterfaceOrientation curorient = [UIApplication sharedApplication].statusBarOrientation;
 
-        // We always want portrait-oriented size, to match UILaunchImageSize.
+        /* We always want portrait-oriented size, to match UILaunchImageSize. */
         if (screenw > screenh) {
             int width = screenw;
             screenw = screenh;
@@ -224,18 +174,18 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
         }
 #endif
 
-        // Xcode 5 introduced a dictionary of launch images in Info.plist.
+        /* Xcode 5 introduced a dictionary of launch images in Info.plist. */
         if (launchimages) {
             for (NSDictionary *dict in launchimages) {
                 NSString *minversion = dict[@"UILaunchImageMinimumOSVersion"];
                 NSString *sizestring = dict[@"UILaunchImageSize"];
 
-                // Ignore this image if the current version is too low.
+                /* Ignore this image if the current version is too low. */
                 if (minversion && !UIKit_IsSystemVersionAtLeast(minversion.doubleValue)) {
                     continue;
                 }
 
-                // Ignore this image if the size doesn't match.
+                /* Ignore this image if the size doesn't match. */
                 if (sizestring) {
                     CGSize size = CGSizeFromString(sizestring);
                     if ((int)(size.width + 0.5) != screenw || (int)(size.height + 0.5) != screenh) {
@@ -243,7 +193,7 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
                     }
                 }
 
-#if !defined(SDL_PLATFORM_TVOS) && !defined(SDL_PLATFORM_VISIONOS)
+#if !TARGET_OS_TV
                 UIInterfaceOrientationMask orientmask = UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown;
                 NSString *orientstring = dict[@"UILaunchImageOrientation"];
 
@@ -259,7 +209,7 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
                     }
                 }
 
-                // Ignore this image if the orientation doesn't match.
+                /* Ignore this image if the orientation doesn't match. */
                 if ((orientmask & (1 << curorient)) == 0) {
                     continue;
                 }
@@ -272,7 +222,7 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
                 image = [UIImage imageNamed:imagename];
             }
         }
-#if !defined(SDL_PLATFORM_TVOS) && !defined(SDL_PLATFORM_VISIONOS)
+#if !TARGET_OS_TV
         else {
             imagename = [bundle objectForInfoDictionaryKey:@"UILaunchImageFile"];
 
@@ -287,18 +237,13 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
 #endif
 
         if (image) {
-#ifdef SDL_PLATFORM_VISIONOS
-            CGRect viewFrame = CGRectMake(0, 0, screenw, screenh);
-#else
-            CGRect viewFrame = [UIScreen mainScreen].bounds;
-#endif
-            UIImageView *view = [[UIImageView alloc] initWithFrame:viewFrame];
+            UIImageView *view = [[UIImageView alloc] initWithFrame:[UIScreen mainScreen].bounds];
             UIImageOrientation imageorient = UIImageOrientationUp;
 
-#if !defined(SDL_PLATFORM_TVOS) && !defined(SDL_PLATFORM_VISIONOS)
-            // Bugs observed / workaround tested in iOS 8.3.
+#if !TARGET_OS_TV
+            /* Bugs observed / workaround tested in iOS 8.3, 7.1, and 6.1. */
             if (UIInterfaceOrientationIsLandscape(curorient)) {
-                if (image.size.width < image.size.height) {
+                if (atleastiOS8 && image.size.width < image.size.height) {
                     /* On iOS 8, portrait launch images displayed in forced-
                      * landscape mode (e.g. a standard Default.png on an iPhone
                      * when Info.plist only supports landscape orientations) need
@@ -308,11 +253,20 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
                     } else if (curorient == UIInterfaceOrientationLandscapeRight) {
                         imageorient = UIImageOrientationLeft;
                     }
+                } else if (!atleastiOS8 && image.size.width > image.size.height) {
+                    /* On iOS 7 and below, landscape launch images displayed in
+                     * landscape mode (e.g. landscape iPad launch images) need
+                     * to be rotated to display in the expected orientation. */
+                    if (curorient == UIInterfaceOrientationLandscapeLeft) {
+                        imageorient = UIImageOrientationLeft;
+                    } else if (curorient == UIInterfaceOrientationLandscapeRight) {
+                        imageorient = UIImageOrientationRight;
+                    }
                 }
             }
 #endif
 
-            // Create the properly oriented image.
+            /* Create the properly oriented image. */
             view.image = [[UIImage alloc] initWithCGImage:image.CGImage scale:image.scale orientation:imageorient];
 
             self.view = view;
@@ -324,13 +278,13 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
 
 - (void)loadView
 {
-    // Do nothing.
+    /* Do nothing. */
 }
 
-#ifndef SDL_PLATFORM_TVOS
+#if !TARGET_OS_TV
 - (BOOL)shouldAutorotate
 {
-    // If YES, the launch image will be incorrectly rotated in some cases.
+    /* If YES, the launch image will be incorrectly rotated in some cases. */
     return NO;
 }
 
@@ -341,16 +295,15 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
      * the ones set here (it will cause an exception in that case.) */
     return UIInterfaceOrientationMaskAll;
 }
-#endif // !SDL_PLATFORM_TVOS
+#endif /* !TARGET_OS_TV */
 
 @end
 
-@implementation SDLUIKitDelegate
-{
+@implementation SDLUIKitDelegate {
     UIWindow *launchWindow;
 }
 
-// convenience method
+/* convenience method */
 + (id)sharedAppDelegate
 {
     /* the delegate is set in UIApplicationMain(), which is guaranteed to be
@@ -376,15 +329,13 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
 
     launchWindow = nil;
 
-    // Do a nice animated fade-out (roughly matches the real launch behavior.)
-    [UIView animateWithDuration:0.2
-        animations:^{
-          window.alpha = 0.0;
-        }
-        completion:^(BOOL finished) {
-          window.hidden = YES;
-          UIKit_ForceUpdateHomeIndicator(); // Wait for launch screen to hide so settings are applied to the actual view controller.
-        }];
+    /* Do a nice animated fade-out (roughly matches the real launch behavior.) */
+    [UIView animateWithDuration:0.2 animations:^{
+        window.alpha = 0.0;
+    } completion:^(BOOL finished) {
+        window.hidden = YES;
+        UIKit_ForceUpdateHomeIndicator(); /* Wait for launch screen to hide so settings are applied to the actual view controller. */
+    }];
 }
 
 - (void)postFinishLaunch
@@ -393,27 +344,27 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
      * have a chance to load resources while the launch screen is still up. */
     [self performSelector:@selector(hideLaunchScreen) withObject:nil afterDelay:0.0];
 
-    // run the user's application, passing argc and argv
-    SDL_SetiOSEventPump(true);
+    /* run the user's application, passing argc and argv */
+    SDL_iPhoneSetEventPump(SDL_TRUE);
     exit_status = forward_main(forward_argc, forward_argv);
-    SDL_SetiOSEventPump(false);
+    SDL_iPhoneSetEventPump(SDL_FALSE);
 
     if (launchWindow) {
         launchWindow.hidden = YES;
         launchWindow = nil;
     }
 
-    // exit, passing the return status from the user's application
+    /* exit, passing the return status from the user's application */
     /* We don't actually exit to support applications that do setup in their
      * main function and then allow the Cocoa event loop to run. */
-    // exit(exit_status);
+    /* exit(exit_status); */
 }
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
 {
     NSBundle *bundle = [NSBundle mainBundle];
 
-#ifdef SDL_IPHONE_LAUNCHSCREEN
+#if SDL_IPHONE_LAUNCHSCREEN
     /* The normal launch screen is displayed until didFinishLaunching returns,
      * but SDL_main is called after that happens and there may be a noticeable
      * delay between the start of SDL_main and when the first real frame is
@@ -423,21 +374,20 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
     UIViewController *vc = nil;
     NSString *screenname = nil;
 
-    // tvOS only uses a plain launch image.
-#if !defined(SDL_PLATFORM_TVOS) && !defined(SDL_PLATFORM_VISIONOS)
+    /* tvOS only uses a plain launch image. */
+#if !TARGET_OS_TV
     screenname = [bundle objectForInfoDictionaryKey:@"UILaunchStoryboardName"];
 
-    if (screenname) {
+    if (screenname && UIKit_IsSystemVersionAtLeast(8.0)) {
         @try {
             /* The launch storyboard is actually a nib in some older versions of
              * Xcode. We'll try to load it as a storyboard first, as it's more
              * modern. */
             UIStoryboard *storyboard = [UIStoryboard storyboardWithName:screenname bundle:bundle];
-            __auto_type storyboardVc = [storyboard instantiateInitialViewController];
-            vc = [[SDLLaunchStoryboardViewController alloc] initWithStoryboardViewController:storyboardVc];
+            vc = [storyboard instantiateInitialViewController];
         }
         @catch (NSException *exception) {
-            // Do nothing (there's more code to execute below).
+            /* Do nothing (there's more code to execute below). */
         }
     }
 #endif
@@ -447,12 +397,7 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
     }
 
     if (vc.view) {
-#ifdef SDL_PLATFORM_VISIONOS
-        CGRect viewFrame = CGRectMake(0, 0, SDL_XR_SCREENWIDTH, SDL_XR_SCREENHEIGHT);
-#else
-        CGRect viewFrame = [UIScreen mainScreen].bounds;
-#endif
-        launchWindow = [[UIWindow alloc] initWithFrame:viewFrame];
+        launchWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
 
         /* We don't want the launch window immediately hidden when a real SDL
          * window is shown - we fade it out ourselves when we're ready. */
@@ -466,8 +411,12 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
     }
 #endif
 
-    // Set working directory to resource path
+    /* Set working directory to resource path */
     [[NSFileManager defaultManager] changeCurrentDirectoryPath:[bundle resourcePath]];
+
+    /* register a callback for the idletimer hint */
+    SDL_AddHintCallback(SDL_HINT_IDLE_TIMER_DISABLED,
+                        SDL_IdleTimerDisabledChanged, NULL);
 
     SDL_SetMainReady();
     [self performSelector:@selector(postFinishLaunch) withObject:nil afterDelay:0.0];
@@ -481,7 +430,7 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
     if (_this) {
         SDL_Window *window = NULL;
         for (window = _this->windows; window != NULL; window = window->next) {
-            SDL_UIKitWindowData *data = (__bridge SDL_UIKitWindowData *)window->internal;
+            SDL_WindowData *data = (__bridge SDL_WindowData *) window->driverdata;
             if (data != nil) {
                 return data.uiwindow;
             }
@@ -492,28 +441,78 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
 
 - (void)setWindow:(UIWindow *)window
 {
-    // Do nothing.
+    /* Do nothing. */
 }
 
-- (void)sendDropFileForURL:(NSURL *)url fromSourceApplication:(NSString *)sourceApplication
+#if !TARGET_OS_TV
+- (void)application:(UIApplication *)application didChangeStatusBarOrientation:(UIInterfaceOrientation)oldStatusBarOrientation
+{
+    SDL_OnApplicationDidChangeStatusBarOrientation();
+}
+#endif
+
+- (void)applicationWillTerminate:(UIApplication *)application
+{
+    SDL_OnApplicationWillTerminate();
+}
+
+- (void)applicationDidReceiveMemoryWarning:(UIApplication *)application
+{
+    SDL_OnApplicationDidReceiveMemoryWarning();
+}
+
+- (void)applicationWillResignActive:(UIApplication*)application
+{
+    SDL_OnApplicationWillResignActive();
+}
+
+- (void)applicationDidEnterBackground:(UIApplication*)application
+{
+    SDL_OnApplicationDidEnterBackground();
+}
+
+- (void)applicationWillEnterForeground:(UIApplication*)application
+{
+    SDL_OnApplicationWillEnterForeground();
+}
+
+- (void)applicationDidBecomeActive:(UIApplication*)application
+{
+    SDL_OnApplicationDidBecomeActive();
+}
+
+- (void)sendDropFileForURL:(NSURL *)url
 {
     NSURL *fileURL = url.filePathURL;
-    const char *sourceApplicationCString = sourceApplication ? [sourceApplication UTF8String] : NULL;
     if (fileURL != nil) {
-        SDL_SendDropFile(NULL, sourceApplicationCString, fileURL.path.UTF8String);
+        SDL_SendDropFile(NULL, fileURL.path.UTF8String);
     } else {
-        SDL_SendDropFile(NULL, sourceApplicationCString, url.absoluteString.UTF8String);
+        SDL_SendDropFile(NULL, url.absoluteString.UTF8String);
     }
     SDL_SendDropComplete(NULL);
 }
 
-- (BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options
+#if TARGET_OS_TV || (defined(__IPHONE_9_0) && __IPHONE_OS_VERSION_MIN_REQUIRED >= __IPHONE_9_0)
+
+- (BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey,id> *)options
 {
-    // TODO: Handle options
-    [self sendDropFileForURL:url fromSourceApplication:NULL];
+    /* TODO: Handle options */
+    [self sendDropFileForURL:url];
     return YES;
 }
 
+#else
+
+- (BOOL)application:(UIApplication *)application openURL:(NSURL *)url sourceApplication:(NSString *)sourceApplication annotation:(id)annotation
+{
+    [self sendDropFileForURL:url];
+    return YES;
+}
+
+#endif
+
 @end
 
-#endif // SDL_VIDEO_DRIVER_UIKIT
+#endif /* SDL_VIDEO_DRIVER_UIKIT */
+
+/* vi: set ts=4 sw=4 expandtab: */

@@ -21,7 +21,8 @@
  */
 
 /* Author: Soren Sandmann <sandmann@redhat.com> */
-#include "SDL_internal.h"
+#include "../../SDL_internal.h"
+#include "SDL_stdinc.h"
 
 #include "edid.h"
 #include <stdlib.h>
@@ -49,7 +50,7 @@ get_bits (int in, int begin, int end)
 static int
 decode_header (const uchar *edid)
 {
-    if (SDL_memcmp (edid, "\x00\xff\xff\xff\xff\xff\xff\x00", 8) == 0)
+    if (memcmp (edid, "\x00\xff\xff\xff\xff\xff\xff\x00", 8) == 0)
 	return TRUE;
     return FALSE;
 }
@@ -75,7 +76,7 @@ decode_vendor_and_product_identification (const uchar *edid, MonitorInfo *info)
 
     /* Serial Number */
     info->serial_number =
-	edid[0x0c] | edid[0x0d] << 8 | edid[0x0e] << 16 | (Uint32)edid[0x0f] << 24;
+	edid[0x0c] | edid[0x0d] << 8 | edid[0x0e] << 16 | edid[0x0f] << 24;
 
     /* Week and Year */
     is_model_year = FALSE;
@@ -521,7 +522,7 @@ decode_check_sum (const uchar *edid,
 MonitorInfo *
 decode_edid (const uchar *edid)
 {
-    MonitorInfo *info = SDL_calloc (1, sizeof (MonitorInfo));
+    MonitorInfo *info = calloc (1, sizeof (MonitorInfo));
 
     decode_check_sum (edid, info);
     
@@ -533,8 +534,8 @@ decode_edid (const uchar *edid)
         !decode_established_timings (edid, info) ||
         !decode_standard_timings (edid, info) ||
         !decode_descriptors (edid, info)) {
-        SDL_free(info);
-        return NULL;
+        free(info);
+	return NULL;
     }
     
     return info;
@@ -622,7 +623,7 @@ dump_monitor_info (MonitorInfo *info)
 	case RGB: s = "rgb"; break;
 	case OTHER_COLOR: s = "other color"; break;
 	default: s = "unknown"; break;
-	}
+	};
 	
 	printf ("Color: %s\n", s);
     }

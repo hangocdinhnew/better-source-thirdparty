@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2021 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -18,7 +18,7 @@
      misrepresented as being the original software.
   3. This notice may not be removed or altered from any source distribution.
 */
-#include "SDL_internal.h"
+#include "../../SDL_internal.h"
 
 #ifndef SDL_x11dyn_h_
 #define SDL_x11dyn_h_
@@ -26,13 +26,12 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
-#include <X11/Xresource.h>
 
-#ifdef SDL_VIDEO_DRIVER_X11_HAS_XKBLOOKUPKEYSYM
+#if SDL_VIDEO_DRIVER_X11_HAS_XKBKEYCODETOKEYSYM
 #include <X11/XKBlib.h>
 #endif
 
-// Apparently some X11 systems can't include this multiple times...
+/* Apparently some X11 systems can't include this multiple times... */
 #ifndef SDL_INCLUDED_XLIBINT_H
 #define SDL_INCLUDED_XLIBINT_H 1
 #include <X11/Xlibint.h>
@@ -40,6 +39,7 @@
 
 #include <X11/Xproto.h>
 #include <X11/extensions/Xext.h>
+#include <X11/extensions/extutil.h>
 
 #ifndef NO_SHARED_MEMORY
 #include <sys/ipc.h>
@@ -47,62 +47,56 @@
 #include <X11/extensions/XShm.h>
 #endif
 
-#ifdef SDL_VIDEO_DRIVER_X11_XCURSOR
+#if SDL_VIDEO_DRIVER_X11_XCURSOR
 #include <X11/Xcursor/Xcursor.h>
 #endif
-#ifdef SDL_VIDEO_DRIVER_X11_XDBE
+#if SDL_VIDEO_DRIVER_X11_XDBE
 #include <X11/extensions/Xdbe.h>
 #endif
-#if defined(SDL_VIDEO_DRIVER_X11_XINPUT2) || defined(SDL_VIDEO_DRIVER_X11_XFIXES)
+#if SDL_VIDEO_DRIVER_X11_XINERAMA
+#include <X11/extensions/Xinerama.h>
+#endif
+#if SDL_VIDEO_DRIVER_X11_XINPUT2
 #include <X11/extensions/XInput2.h>
 #endif
-#ifdef SDL_VIDEO_DRIVER_X11_XFIXES
-#include <X11/extensions/Xfixes.h>
-#endif
-#ifdef SDL_VIDEO_DRIVER_X11_XSYNC
-#include <X11/extensions/sync.h>
-#endif
-#ifdef SDL_VIDEO_DRIVER_X11_XRANDR
+#if SDL_VIDEO_DRIVER_X11_XRANDR
 #include <X11/extensions/Xrandr.h>
 #endif
-#ifdef SDL_VIDEO_DRIVER_X11_XSCRNSAVER
+#if SDL_VIDEO_DRIVER_X11_XSCRNSAVER
 #include <X11/extensions/scrnsaver.h>
 #endif
-#ifdef SDL_VIDEO_DRIVER_X11_XSHAPE
+#if SDL_VIDEO_DRIVER_X11_XSHAPE
 #include <X11/extensions/shape.h>
 #endif
-#ifdef SDL_VIDEO_DRIVER_X11_XTEST
-#include <X11/extensions/XTest.h>
+#if SDL_VIDEO_DRIVER_X11_XVIDMODE
+#include <X11/extensions/xf86vmode.h>
 #endif
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-// evil function signatures...
-typedef Bool (*SDL_X11_XESetWireToEventRetType)(Display *, XEvent *, xEvent *);
-typedef int (*SDL_X11_XSynchronizeRetType)(Display *);
-typedef Status (*SDL_X11_XESetEventToWireRetType)(Display *, XEvent *, xEvent *);
+/* evil function signatures... */
+typedef Bool(*SDL_X11_XESetWireToEventRetType) (Display *, XEvent *, xEvent *);
+typedef int (*SDL_X11_XSynchronizeRetType) (Display *);
+typedef Status(*SDL_X11_XESetEventToWireRetType) (Display *, XEvent *, xEvent *);
 
-extern bool SDL_X11_LoadSymbols(void);
-extern void SDL_X11_UnloadSymbols(void);
+int SDL_X11_LoadSymbols(void);
+void SDL_X11_UnloadSymbols(void);
 
-// Declare all the function pointers and wrappers...
-#define SDL_X11_SYM(rc, fn, params, args, ret) \
-    typedef rc(*SDL_DYNX11FN_##fn) params;     \
+/* Declare all the function pointers and wrappers... */
+#define SDL_X11_SYM(rc,fn,params,args,ret) \
+    typedef rc (*SDL_DYNX11FN_##fn) params; \
     extern SDL_DYNX11FN_##fn X11_##fn;
 #include "SDL_x11sym.h"
 
-// Annoying varargs entry point...
+/* Annoying varargs entry point... */
 #ifdef X_HAVE_UTF8_STRING
-typedef XIC (*SDL_DYNX11FN_XCreateIC)(XIM, ...);
-typedef char *(*SDL_DYNX11FN_XGetICValues)(XIC, ...);
-typedef char *(*SDL_DYNX11FN_XSetICValues)(XIC, ...);
-typedef XVaNestedList (*SDL_DYNX11FN_XVaCreateNestedList)(int, ...);
+typedef XIC(*SDL_DYNX11FN_XCreateIC) (XIM,...);
+typedef char *(*SDL_DYNX11FN_XGetICValues) (XIC, ...);
 extern SDL_DYNX11FN_XCreateIC X11_XCreateIC;
 extern SDL_DYNX11FN_XGetICValues X11_XGetICValues;
-extern SDL_DYNX11FN_XSetICValues X11_XSetICValues;
-extern SDL_DYNX11FN_XVaCreateNestedList X11_XVaCreateNestedList;
 #endif
 
 /* These SDL_X11_HAVE_* flags are here whether you have dynamic X11 or not. */
@@ -113,4 +107,5 @@ extern SDL_DYNX11FN_XVaCreateNestedList X11_XVaCreateNestedList;
 }
 #endif
 
-#endif // !defined SDL_x11dyn_h_
+#endif                          /* !defined SDL_x11dyn_h_ */
+/* vi: set ts=4 sw=4 expandtab: */

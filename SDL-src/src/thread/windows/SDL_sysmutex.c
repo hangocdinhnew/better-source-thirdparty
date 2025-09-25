@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2021 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -18,9 +18,9 @@
      misrepresented as being the original software.
   3. This notice may not be removed or altered from any source distribution.
 */
-#include "SDL_internal.h"
+#include "../../SDL_internal.h"
 
-#ifdef SDL_THREAD_WINDOWS
+#if SDL_THREAD_WINDOWS
 
 /**
  * Mutex functions using the Win32 API
@@ -30,44 +30,68 @@
  * which are chosen at runtime.
  */
 
+
+#include "SDL_hints.h"
+
 #include "SDL_sysmutex_c.h"
 
-// Implementation will be chosen at runtime based on available Kernel features
-SDL_mutex_impl_t SDL_mutex_impl_active = { 0 };
+
+/* Implementation will be chosen at runtime based on available Kernel features */
+SDL_mutex_impl_t SDL_mutex_impl_active = {0};
+
 
 /**
  * Implementation based on Slim Reader/Writer (SRW) Locks for Win 7 and newer.
  */
 
-typedef VOID(WINAPI *pfnInitializeSRWLock)(PSRWLOCK);
+#if __WINRT__
+/* Functions are guaranteed to be available */
+#define pReleaseSRWLockExclusive ReleaseSRWLockExclusive
+#define pAcquireSRWLockExclusive AcquireSRWLockExclusive
+#define pTryAcquireSRWLockExclusive TryAcquireSRWLockExclusive
+#else
 typedef VOID(WINAPI *pfnReleaseSRWLockExclusive)(PSRWLOCK);
 typedef VOID(WINAPI *pfnAcquireSRWLockExclusive)(PSRWLOCK);
 typedef BOOLEAN(WINAPI *pfnTryAcquireSRWLockExclusive)(PSRWLOCK);
-static pfnInitializeSRWLock pInitializeSRWLock = NULL;
 static pfnReleaseSRWLockExclusive pReleaseSRWLockExclusive = NULL;
 static pfnAcquireSRWLockExclusive pAcquireSRWLockExclusive = NULL;
 static pfnTryAcquireSRWLockExclusive pTryAcquireSRWLockExclusive = NULL;
+#endif
 
-static SDL_Mutex *SDL_CreateMutex_srw(void)
+static SDL_mutex *
+SDL_CreateMutex_srw(void)
 {
-    SDL_mutex_srw *mutex = (SDL_mutex_srw *)SDL_calloc(1, sizeof(*mutex));
-    if (mutex) {
-        pInitializeSRWLock(&mutex->srw);
+    SDL_mutex_srw *mutex;
+
+    /* Relies on SRWLOCK_INIT == 0. */
+    mutex = (SDL_mutex_srw *) SDL_calloc(1, sizeof(*mutex));
+    if (!mutex) {
+        SDL_OutOfMemory();
     }
-    return (SDL_Mutex *)mutex;
+
+    return (SDL_mutex *)mutex;
 }
 
-static void SDL_DestroyMutex_srw(SDL_Mutex *mutex)
+static void
+SDL_DestroyMutex_srw(SDL_mutex * mutex)
 {
-    // There are no kernel allocated resources
-    SDL_free(mutex);
+    if (mutex) {
+        /* There are no kernel allocated resources */
+        SDL_free(mutex);
+    }
 }
 
-static void SDL_LockMutex_srw(SDL_Mutex *_mutex) SDL_NO_THREAD_SAFETY_ANALYSIS  // clang doesn't know about NULL mutexes
+static int
+SDL_LockMutex_srw(SDL_mutex * _mutex)
 {
     SDL_mutex_srw *mutex = (SDL_mutex_srw *)_mutex;
-    const DWORD this_thread = GetCurrentThreadId();
+    DWORD this_thread;
 
+    if (mutex == NULL) {
+        return SDL_SetError("Passed a NULL mutex");
+    }
+
+    this_thread = GetCurrentThreadId();
     if (mutex->owner == this_thread) {
         ++mutex->count;
     } else {
@@ -80,14 +104,21 @@ static void SDL_LockMutex_srw(SDL_Mutex *_mutex) SDL_NO_THREAD_SAFETY_ANALYSIS  
         mutex->owner = this_thread;
         mutex->count = 1;
     }
+    return 0;
 }
 
-static bool SDL_TryLockMutex_srw(SDL_Mutex *_mutex)
+static int
+SDL_TryLockMutex_srw(SDL_mutex * _mutex)
 {
     SDL_mutex_srw *mutex = (SDL_mutex_srw *)_mutex;
-    const DWORD this_thread = GetCurrentThreadId();
-    bool retval = true;
+    DWORD this_thread;
+    int retval = 0;
 
+    if (mutex == NULL) {
+        return SDL_SetError("Passed a NULL mutex");
+    }
+
+    this_thread = GetCurrentThreadId();
     if (mutex->owner == this_thread) {
         ++mutex->count;
     } else {
@@ -96,15 +127,20 @@ static bool SDL_TryLockMutex_srw(SDL_Mutex *_mutex)
             mutex->owner = this_thread;
             mutex->count = 1;
         } else {
-            retval = false;
+            retval = SDL_MUTEX_TIMEDOUT;
         }
     }
     return retval;
 }
 
-static void SDL_UnlockMutex_srw(SDL_Mutex *_mutex) SDL_NO_THREAD_SAFETY_ANALYSIS  // clang doesn't know about NULL mutexes
+static int
+SDL_UnlockMutex_srw(SDL_mutex * _mutex)
 {
     SDL_mutex_srw *mutex = (SDL_mutex_srw *)_mutex;
+
+    if (mutex == NULL) {
+        return SDL_SetError("Passed a NULL mutex");
+    }
 
     if (mutex->owner == GetCurrentThreadId()) {
         if (--mutex->count == 0) {
@@ -112,11 +148,14 @@ static void SDL_UnlockMutex_srw(SDL_Mutex *_mutex) SDL_NO_THREAD_SAFETY_ANALYSIS
             pReleaseSRWLockExclusive(&mutex->srw);
         }
     } else {
-        SDL_assert(!"mutex not owned by this thread");  // undefined behavior...!
+        return SDL_SetError("mutex not owned by this thread");
     }
+
+    return 0;
 }
 
-static const SDL_mutex_impl_t SDL_mutex_impl_srw = {
+static const SDL_mutex_impl_t SDL_mutex_impl_srw =
+{
     &SDL_CreateMutex_srw,
     &SDL_DestroyMutex_srw,
     &SDL_LockMutex_srw,
@@ -125,48 +164,93 @@ static const SDL_mutex_impl_t SDL_mutex_impl_srw = {
     SDL_MUTEX_SRW,
 };
 
+
 /**
  * Fallback Mutex implementation using Critical Sections (before Win 7)
  */
 
-static SDL_Mutex *SDL_CreateMutex_cs(void)
+typedef struct SDL_mutex_cs
 {
-    SDL_mutex_cs *mutex = (SDL_mutex_cs *)SDL_malloc(sizeof(*mutex));
+    CRITICAL_SECTION cs;
+} SDL_mutex_cs;
+
+/* Create a mutex */
+static SDL_mutex *
+SDL_CreateMutex_cs(void)
+{
+    SDL_mutex_cs *mutex;
+
+    /* Allocate mutex memory */
+    mutex = (SDL_mutex_cs *) SDL_malloc(sizeof(*mutex));
     if (mutex) {
-        // Initialize
-        // On SMP systems, a non-zero spin count generally helps performance
-        // This function always succeeds
-        (void)InitializeCriticalSectionAndSpinCount(&mutex->cs, 2000);
+        /* Initialize */
+        /* On SMP systems, a non-zero spin count generally helps performance */
+#if __WINRT__
+        InitializeCriticalSectionEx(&mutex->cs, 2000, 0);
+#else
+        InitializeCriticalSectionAndSpinCount(&mutex->cs, 2000);
+#endif
+    } else {
+        SDL_OutOfMemory();
     }
-    return (SDL_Mutex *)mutex;
+    return (SDL_mutex *)mutex;
 }
 
-static void SDL_DestroyMutex_cs(SDL_Mutex *mutex_)
+/* Free the mutex */
+static void
+SDL_DestroyMutex_cs(SDL_mutex * mutex_)
 {
     SDL_mutex_cs *mutex = (SDL_mutex_cs *)mutex_;
-    DeleteCriticalSection(&mutex->cs);
-    SDL_free(mutex);
+    if (mutex) {
+        DeleteCriticalSection(&mutex->cs);
+        SDL_free(mutex);
+    }
 }
 
-static void SDL_LockMutex_cs(SDL_Mutex *mutex_) SDL_NO_THREAD_SAFETY_ANALYSIS  // clang doesn't know about NULL mutexes
+/* Lock the mutex */
+static int
+SDL_LockMutex_cs(SDL_mutex * mutex_)
 {
     SDL_mutex_cs *mutex = (SDL_mutex_cs *)mutex_;
+    if (mutex == NULL) {
+        return SDL_SetError("Passed a NULL mutex");
+    }
+
     EnterCriticalSection(&mutex->cs);
+    return 0;
 }
 
-static bool SDL_TryLockMutex_cs(SDL_Mutex *mutex_)
+/* TryLock the mutex */
+static int
+SDL_TryLockMutex_cs(SDL_mutex * mutex_)
 {
     SDL_mutex_cs *mutex = (SDL_mutex_cs *)mutex_;
-    return (TryEnterCriticalSection(&mutex->cs) == TRUE);
+    int retval = 0;
+    if (mutex == NULL) {
+        return SDL_SetError("Passed a NULL mutex");
+    }
+
+    if (TryEnterCriticalSection(&mutex->cs) == 0) {
+        retval = SDL_MUTEX_TIMEDOUT;
+    }
+    return retval;
 }
 
-static void SDL_UnlockMutex_cs(SDL_Mutex *mutex_) SDL_NO_THREAD_SAFETY_ANALYSIS  // clang doesn't know about NULL mutexes
+/* Unlock the mutex */
+static int
+SDL_UnlockMutex_cs(SDL_mutex * mutex_)
 {
     SDL_mutex_cs *mutex = (SDL_mutex_cs *)mutex_;
+    if (mutex == NULL) {
+        return SDL_SetError("Passed a NULL mutex");
+    }
+
     LeaveCriticalSection(&mutex->cs);
+    return 0;
 }
 
-static const SDL_mutex_impl_t SDL_mutex_impl_cs = {
+static const SDL_mutex_impl_t SDL_mutex_impl_cs =
+{
     &SDL_CreateMutex_cs,
     &SDL_DestroyMutex_cs,
     &SDL_LockMutex_cs,
@@ -175,64 +259,64 @@ static const SDL_mutex_impl_t SDL_mutex_impl_cs = {
     SDL_MUTEX_CS,
 };
 
+
 /**
  * Runtime selection and redirection
  */
 
-SDL_Mutex *SDL_CreateMutex(void)
+SDL_mutex *
+SDL_CreateMutex(void)
 {
-    if (!SDL_mutex_impl_active.Create) {
-        const SDL_mutex_impl_t *impl = &SDL_mutex_impl_cs;
+    if (SDL_mutex_impl_active.Create == NULL) {
+        /* Default to fallback implementation */
+        const SDL_mutex_impl_t * impl = &SDL_mutex_impl_cs;
 
-        // Try faster implementation for Windows 7 and newer
-        HMODULE kernel32 = GetModuleHandle(TEXT("kernel32.dll"));
-        if (kernel32) {
-            // Requires Vista:
-            pInitializeSRWLock = (pfnInitializeSRWLock)GetProcAddress(kernel32, "InitializeSRWLock");
-            pReleaseSRWLockExclusive = (pfnReleaseSRWLockExclusive)GetProcAddress(kernel32, "ReleaseSRWLockExclusive");
-            pAcquireSRWLockExclusive = (pfnAcquireSRWLockExclusive)GetProcAddress(kernel32, "AcquireSRWLockExclusive");
-            // Requires 7:
-            pTryAcquireSRWLockExclusive = (pfnTryAcquireSRWLockExclusive)GetProcAddress(kernel32, "TryAcquireSRWLockExclusive");
-            if (pInitializeSRWLock && pReleaseSRWLockExclusive && pAcquireSRWLockExclusive && pTryAcquireSRWLockExclusive) {
-                impl = &SDL_mutex_impl_srw;
+        if (!SDL_GetHintBoolean(SDL_HINT_WINDOWS_FORCE_MUTEX_CRITICAL_SECTIONS, SDL_FALSE)) {
+#if __WINRT__
+            /* Link statically on this platform */
+            impl = &SDL_mutex_impl_srw;
+#else
+            /* Try faster implementation for Windows 7 and newer */
+            HMODULE kernel32 = GetModuleHandle(TEXT("kernel32.dll"));
+            if (kernel32) {
+                /* Requires Vista: */
+                pReleaseSRWLockExclusive = (pfnReleaseSRWLockExclusive) GetProcAddress(kernel32, "ReleaseSRWLockExclusive");
+                pAcquireSRWLockExclusive = (pfnAcquireSRWLockExclusive) GetProcAddress(kernel32, "AcquireSRWLockExclusive");
+                /* Requires 7: */
+                pTryAcquireSRWLockExclusive = (pfnTryAcquireSRWLockExclusive) GetProcAddress(kernel32, "TryAcquireSRWLockExclusive");
+                if (pReleaseSRWLockExclusive && pAcquireSRWLockExclusive && pTryAcquireSRWLockExclusive) {
+                    impl = &SDL_mutex_impl_srw;
+                }
             }
+#endif
         }
 
-        // Copy instead of using pointer to save one level of indirection
-        SDL_copyp(&SDL_mutex_impl_active, impl);
+        /* Copy instead of using pointer to save one level of indirection */
+        SDL_memcpy(&SDL_mutex_impl_active, impl, sizeof(SDL_mutex_impl_active));
     }
     return SDL_mutex_impl_active.Create();
 }
 
-void SDL_DestroyMutex(SDL_Mutex *mutex)
-{
-    if (mutex) {
-        SDL_mutex_impl_active.Destroy(mutex);
-    }
+void
+SDL_DestroyMutex(SDL_mutex * mutex) {
+    SDL_mutex_impl_active.Destroy(mutex);
 }
 
-void SDL_LockMutex(SDL_Mutex *mutex)
-{
-    if (mutex) {
-        SDL_mutex_impl_active.Lock(mutex);
-    }
+int
+SDL_LockMutex(SDL_mutex * mutex) {
+    return SDL_mutex_impl_active.Lock(mutex);
 }
 
-bool SDL_TryLockMutex(SDL_Mutex *mutex)
-{
-    bool result = true;
-
-    if (mutex) {
-        result = SDL_mutex_impl_active.TryLock(mutex);
-    }
-    return result;
+int
+SDL_TryLockMutex(SDL_mutex * mutex) {
+    return SDL_mutex_impl_active.TryLock(mutex);
 }
 
-void SDL_UnlockMutex(SDL_Mutex *mutex)
-{
-    if (mutex) {
-        SDL_mutex_impl_active.Unlock(mutex);
-    }
+int
+SDL_UnlockMutex(SDL_mutex * mutex) {
+    return SDL_mutex_impl_active.Unlock(mutex);
 }
 
-#endif // SDL_THREAD_WINDOWS
+#endif /* SDL_THREAD_WINDOWS */
+
+/* vi: set ts=4 sw=4 expandtab: */

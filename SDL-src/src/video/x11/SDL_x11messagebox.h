@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2021 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -22,10 +22,12 @@
 #ifndef SDL_x11messagebox_h_
 #define SDL_x11messagebox_h_
 
-#ifdef SDL_VIDEO_DRIVER_X11
+#if SDL_VIDEO_DRIVER_X11
 
-extern bool X11_ShowMessageBox(const SDL_MessageBoxData *messageboxdata, int *buttonID);
+extern int X11_ShowMessageBox(const SDL_MessageBoxData *messageboxdata, int *buttonid);
 
-#endif // SDL_VIDEO_DRIVER_X11
+#endif /* SDL_VIDEO_DRIVER_X11 */
 
-#endif // SDL_x11messagebox_h_
+#endif /* SDL_x11messagebox_h_ */
+
+/* vi: set ts=4 sw=4 expandtab: */

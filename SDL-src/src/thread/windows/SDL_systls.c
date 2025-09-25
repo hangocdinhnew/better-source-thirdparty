@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2021 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -19,63 +19,66 @@
   3. This notice may not be removed or altered from any source distribution.
 */
 
-#include "SDL_internal.h"
+#include "../../SDL_internal.h"
 
-#ifdef SDL_THREAD_WINDOWS
+#if SDL_THREAD_WINDOWS
 
 #include "../../core/windows/SDL_windows.h"
 
+#include "SDL_thread.h"
 #include "../SDL_thread_c.h"
 
-static DWORD thread_local_storage = TLS_OUT_OF_INDEXES;
-static bool generic_local_storage = false;
+#if WINAPI_FAMILY_WINRT
+#include <fibersapi.h>
 
-void SDL_SYS_InitTLSData(void)
+#ifndef TLS_OUT_OF_INDEXES
+#define TLS_OUT_OF_INDEXES  FLS_OUT_OF_INDEXES
+#endif
+
+#define TlsAlloc()  FlsAlloc(NULL)
+#define TlsSetValue FlsSetValue
+#define TlsGetValue FlsGetValue
+#endif
+
+static DWORD thread_local_storage = TLS_OUT_OF_INDEXES;
+static SDL_bool generic_local_storage = SDL_FALSE;
+
+SDL_TLSData *
+SDL_SYS_GetTLSData(void)
 {
     if (thread_local_storage == TLS_OUT_OF_INDEXES && !generic_local_storage) {
-        thread_local_storage = TlsAlloc();
-        if (thread_local_storage == TLS_OUT_OF_INDEXES) {
-            SDL_Generic_InitTLSData();
-            generic_local_storage = true;
+        static SDL_SpinLock lock;
+        SDL_AtomicLock(&lock);
+        if (thread_local_storage == TLS_OUT_OF_INDEXES && !generic_local_storage) {
+            DWORD storage = TlsAlloc();
+            if (storage != TLS_OUT_OF_INDEXES) {
+                SDL_MemoryBarrierRelease();
+                thread_local_storage = storage;
+            } else {
+                generic_local_storage = SDL_TRUE;
+            }
         }
+        SDL_AtomicUnlock(&lock);
     }
-}
-
-SDL_TLSData *SDL_SYS_GetTLSData(void)
-{
     if (generic_local_storage) {
         return SDL_Generic_GetTLSData();
     }
-
-    if (thread_local_storage != TLS_OUT_OF_INDEXES) {
-        return (SDL_TLSData *)TlsGetValue(thread_local_storage);
-    }
-    return NULL;
+    SDL_MemoryBarrierAcquire();
+    return (SDL_TLSData *)TlsGetValue(thread_local_storage);
 }
 
-bool SDL_SYS_SetTLSData(SDL_TLSData *data)
+int
+SDL_SYS_SetTLSData(SDL_TLSData *data)
 {
     if (generic_local_storage) {
         return SDL_Generic_SetTLSData(data);
     }
-
     if (!TlsSetValue(thread_local_storage, data)) {
-        return WIN_SetError("TlsSetValue()");
+        return SDL_SetError("TlsSetValue() failed");
     }
-    return true;
+    return 0;
 }
 
-void SDL_SYS_QuitTLSData(void)
-{
-    if (generic_local_storage) {
-        SDL_Generic_QuitTLSData();
-        generic_local_storage = false;
-    } else {
-        if (thread_local_storage != TLS_OUT_OF_INDEXES) {
-            TlsFree(thread_local_storage);
-            thread_local_storage = TLS_OUT_OF_INDEXES;
-        }
-    }
-}
+#endif /* SDL_THREAD_WINDOWS */
 
-#endif // SDL_THREAD_WINDOWS
+/* vi: set ts=4 sw=4 expandtab: */

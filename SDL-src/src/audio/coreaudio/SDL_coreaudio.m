@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2021 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -18,10 +18,15 @@
      misrepresented as being the original software.
   3. This notice may not be removed or altered from any source distribution.
 */
-#include "SDL_internal.h"
+#include "../../SDL_internal.h"
 
-#ifdef SDL_AUDIO_DRIVER_COREAUDIO
+#if SDL_AUDIO_DRIVER_COREAUDIO
 
+/* !!! FIXME: clean out some of the macro salsa in here. */
+
+#include "SDL_audio.h"
+#include "SDL_hints.h"
+#include "../SDL_audio_c.h"
 #include "../SDL_sysaudio.h"
 #include "SDL_coreaudio.h"
 #include "../../thread/SDL_systhread.h"
@@ -31,332 +36,319 @@
 #if DEBUG_COREAUDIO
     #define CHECK_RESULT(msg) \
         if (result != noErr) { \
-            SDL_Log("COREAUDIO: Got error %d from '%s'!", (int)result, msg); \
-            return SDL_SetError("CoreAudio error (%s): %d", msg, (int)result); \
+            printf("COREAUDIO: Got error %d from '%s'!\n", (int) result, msg); \
+            SDL_SetError("CoreAudio error (%s): %d", msg, (int) result); \
+            return 0; \
         }
 #else
     #define CHECK_RESULT(msg) \
         if (result != noErr) { \
-            return SDL_SetError("CoreAudio error (%s): %d", msg, (int)result); \
+            SDL_SetError("CoreAudio error (%s): %d", msg, (int) result); \
+            return 0; \
         }
 #endif
 
-#ifdef MACOSX_COREAUDIO
-// Apparently AudioDeviceID values might not be unique, so we wrap it in an SDL_malloc()'d pointer
-//  to make it so. Use FindCoreAudioDeviceByHandle to deal with this redirection, if you need to
-//  map from an AudioDeviceID to a SDL handle.
-typedef struct SDLCoreAudioHandle
-{
-    AudioDeviceID devid;
-    bool recording;
-} SDLCoreAudioHandle;
 
-static bool TestCoreAudioDeviceHandleCallback(SDL_AudioDevice *device, void *handle)
-{
-    const SDLCoreAudioHandle *a = (const SDLCoreAudioHandle *) device->handle;
-    const SDLCoreAudioHandle *b = (const SDLCoreAudioHandle *) handle;
-    return (a->devid == b->devid) && (!!a->recording == !!b->recording);
-}
-
-static SDL_AudioDevice *FindCoreAudioDeviceByHandle(const AudioDeviceID devid, const bool recording)
-{
-    SDLCoreAudioHandle handle = { devid, recording };
-    return SDL_FindPhysicalAudioDeviceByCallback(TestCoreAudioDeviceHandleCallback, &handle);
-}
-
+#if MACOSX_COREAUDIO
 static const AudioObjectPropertyAddress devlist_address = {
     kAudioHardwarePropertyDevices,
     kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyElementMain
+    kAudioObjectPropertyElementMaster
 };
 
-static const AudioObjectPropertyAddress default_playback_device_address = {
-    kAudioHardwarePropertyDefaultOutputDevice,
-    kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyElementMain
-};
+typedef void (*addDevFn)(const char *name, SDL_AudioSpec *spec, const int iscapture, AudioDeviceID devId, void *data);
 
-static const AudioObjectPropertyAddress default_recording_device_address = {
-    kAudioHardwarePropertyDefaultInputDevice,
-    kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyElementMain
-};
-
-static const AudioObjectPropertyAddress alive_address = {
-    kAudioDevicePropertyDeviceIsAlive,
-    kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyElementMain
-};
-
-
-static OSStatus DeviceAliveNotification(AudioObjectID devid, UInt32 num_addr, const AudioObjectPropertyAddress *addrs, void *data)
+typedef struct AudioDeviceList
 {
-    SDL_AudioDevice *device = (SDL_AudioDevice *)data;
-    SDL_assert(((const SDLCoreAudioHandle *) device->handle)->devid == devid);
+    AudioDeviceID devid;
+    SDL_bool alive;
+    struct AudioDeviceList *next;
+} AudioDeviceList;
 
-    UInt32 alive = 1;
-    UInt32 size = sizeof(alive);
-    const OSStatus error = AudioObjectGetPropertyData(devid, addrs, 0, NULL, &size, &alive);
+static AudioDeviceList *output_devs = NULL;
+static AudioDeviceList *capture_devs = NULL;
 
-    bool dead = false;
-    if (error == kAudioHardwareBadDeviceError) {
-        dead = true; // device was unplugged.
-    } else if ((error == kAudioHardwareNoError) && (!alive)) {
-        dead = true; // device died in some other way.
+static SDL_bool
+add_to_internal_dev_list(const int iscapture, AudioDeviceID devId)
+{
+    AudioDeviceList *item = (AudioDeviceList *) SDL_malloc(sizeof (AudioDeviceList));
+    if (item == NULL) {
+        return SDL_FALSE;
+    }
+    item->devid = devId;
+    item->alive = SDL_TRUE;
+    item->next = iscapture ? capture_devs : output_devs;
+    if (iscapture) {
+        capture_devs = item;
+    } else {
+        output_devs = item;
     }
 
-    if (dead) {
-        #if DEBUG_COREAUDIO
-        SDL_Log("COREAUDIO: device '%s' is lost!", device->name);
-        #endif
-        SDL_AudioDeviceDisconnected(device);
+    return SDL_TRUE;
+}
+
+static void
+addToDevList(const char *name, SDL_AudioSpec *spec, const int iscapture, AudioDeviceID devId, void *data)
+{
+    if (add_to_internal_dev_list(iscapture, devId)) {
+        SDL_AddAudioDevice(iscapture, name, spec, (void *) ((size_t) devId));
     }
-
-    return noErr;
 }
 
-static void COREAUDIO_FreeDeviceHandle(SDL_AudioDevice *device)
+static void
+build_device_list(int iscapture, addDevFn addfn, void *addfndata)
 {
-    SDLCoreAudioHandle *handle = (SDLCoreAudioHandle *) device->handle;
-    AudioObjectRemovePropertyListener(handle->devid, &alive_address, DeviceAliveNotification, device);
-    SDL_free(handle);
-}
-
-// This only _adds_ new devices. Removal is handled by devices triggering kAudioDevicePropertyDeviceIsAlive property changes.
-static void RefreshPhysicalDevices(void)
-{
+    OSStatus result = noErr;
     UInt32 size = 0;
     AudioDeviceID *devs = NULL;
-    bool isstack;
+    UInt32 i = 0;
+    UInt32 max = 0;
 
-    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devlist_address, 0, NULL, &size) != kAudioHardwareNoError) {
+    result = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject,
+                                            &devlist_address, 0, NULL, &size);
+    if (result != kAudioHardwareNoError)
         return;
-    } else if ((devs = (AudioDeviceID *) SDL_small_alloc(Uint8, size, &isstack)) == NULL) {
-        return;
-    } else if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &devlist_address, 0, NULL, &size, devs) != kAudioHardwareNoError) {
-        SDL_small_free(devs, isstack);
-        return;
-    }
 
-    const UInt32 total_devices = (UInt32) (size / sizeof(AudioDeviceID));
-    for (UInt32 i = 0; i < total_devices; i++) {
-        if (FindCoreAudioDeviceByHandle(devs[i], true) || FindCoreAudioDeviceByHandle(devs[i], false)) {
-            devs[i] = 0;  // The system and SDL both agree it's already here, don't check it again.
-        }
-    }
+    devs = (AudioDeviceID *) alloca(size);
+    if (devs == NULL)
+        return;
 
-    // any non-zero items remaining in `devs` are new devices to be added.
-    for (int recording = 0; recording < 2; recording++) {
+    result = AudioObjectGetPropertyData(kAudioObjectSystemObject,
+                                        &devlist_address, 0, NULL, &size, devs);
+    if (result != kAudioHardwareNoError)
+        return;
+
+    max = size / sizeof (AudioDeviceID);
+    for (i = 0; i < max; i++) {
+        CFStringRef cfstr = NULL;
+        char *ptr = NULL;
+        AudioDeviceID dev = devs[i];
+        AudioBufferList *buflist = NULL;
+        int usable = 0;
+        CFIndex len = 0;
+        double sampleRate = 0;
+        SDL_AudioSpec spec;
         const AudioObjectPropertyAddress addr = {
             kAudioDevicePropertyStreamConfiguration,
-            recording ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
-            kAudioObjectPropertyElementMain
+            iscapture ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
+            kAudioObjectPropertyElementMaster
         };
         const AudioObjectPropertyAddress nameaddr = {
             kAudioObjectPropertyName,
-            recording ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
-            kAudioObjectPropertyElementMain
+            iscapture ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
+            kAudioObjectPropertyElementMaster
         };
         const AudioObjectPropertyAddress freqaddr = {
             kAudioDevicePropertyNominalSampleRate,
-            recording ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
-            kAudioObjectPropertyElementMain
+            iscapture ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
+            kAudioObjectPropertyElementMaster
         };
 
-        for (UInt32 i = 0; i < total_devices; i++) {
-            const AudioDeviceID dev = devs[i];
-            if (!dev) {
-                continue;  // already added.
+        result = AudioObjectGetPropertyDataSize(dev, &addr, 0, NULL, &size);
+        if (result != noErr)
+            continue;
+
+        buflist = (AudioBufferList *) SDL_malloc(size);
+        if (buflist == NULL)
+            continue;
+
+        result = AudioObjectGetPropertyData(dev, &addr, 0, NULL,
+                                            &size, buflist);
+
+        SDL_zero(spec);
+        if (result == noErr) {
+            UInt32 j;
+            for (j = 0; j < buflist->mNumberBuffers; j++) {
+                spec.channels += buflist->mBuffers[j].mNumberChannels;
             }
+        }
 
-            AudioBufferList *buflist = NULL;
-            double sampleRate = 0;
+        SDL_free(buflist);
 
-            if (AudioObjectGetPropertyDataSize(dev, &addr, 0, NULL, &size) != noErr) {
-                continue;
-            } else if ((buflist = (AudioBufferList *)SDL_malloc(size)) == NULL) {
-                continue;
+        if (spec.channels == 0)
+            continue;
+
+        size = sizeof (sampleRate);
+        result = AudioObjectGetPropertyData(dev, &freqaddr, 0, NULL, &size, &sampleRate);
+        if (result == noErr) {
+            spec.freq = (int) sampleRate;
+        }
+
+        size = sizeof (CFStringRef);
+        result = AudioObjectGetPropertyData(dev, &nameaddr, 0, NULL, &size, &cfstr);
+        if (result != kAudioHardwareNoError)
+            continue;
+
+        len = CFStringGetMaximumSizeForEncoding(CFStringGetLength(cfstr),
+                                                kCFStringEncodingUTF8);
+
+        ptr = (char *) SDL_malloc(len + 1);
+        usable = ((ptr != NULL) &&
+                  (CFStringGetCString
+                   (cfstr, ptr, len + 1, kCFStringEncodingUTF8)));
+
+        CFRelease(cfstr);
+
+        if (usable) {
+            len = strlen(ptr);
+            /* Some devices have whitespace at the end...trim it. */
+            while ((len > 0) && (ptr[len - 1] == ' ')) {
+                len--;
             }
+            usable = (len > 0);
+        }
 
-            OSStatus result = AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, buflist);
+        if (usable) {
+            ptr[len] = '\0';
 
-            SDL_AudioSpec spec;
-            SDL_zero(spec);
-            if (result == noErr) {
-                for (Uint32 j = 0; j < buflist->mNumberBuffers; j++) {
-                    spec.channels += buflist->mBuffers[j].mNumberChannels;
-                }
-            }
+#if DEBUG_COREAUDIO
+            printf("COREAUDIO: Found %s device #%d: '%s' (devid %d)\n",
+                   ((iscapture) ? "capture" : "output"),
+                   (int) i, ptr, (int) dev);
+#endif
+            addfn(ptr, &spec, iscapture, dev, addfndata);
+        }
+        SDL_free(ptr);  /* addfn() would have copied the string. */
+    }
+}
 
-            SDL_free(buflist);
+static void
+free_audio_device_list(AudioDeviceList **list)
+{
+    AudioDeviceList *item = *list;
+    while (item) {
+        AudioDeviceList *next = item->next;
+        SDL_free(item);
+        item = next;
+    }
+    *list = NULL;
+}
 
-            if (spec.channels == 0) {
-                continue;
-            }
+static void
+COREAUDIO_DetectDevices(void)
+{
+    build_device_list(SDL_TRUE, addToDevList, NULL);
+    build_device_list(SDL_FALSE, addToDevList, NULL);
+}
 
-            size = sizeof(sampleRate);
-            if (AudioObjectGetPropertyData(dev, &freqaddr, 0, NULL, &size, &sampleRate) == noErr) {
-                spec.freq = (int)sampleRate;
-            }
-
-            CFStringRef cfstr = NULL;
-            size = sizeof(CFStringRef);
-            if (AudioObjectGetPropertyData(dev, &nameaddr, 0, NULL, &size, &cfstr) != kAudioHardwareNoError) {
-                continue;
-            }
-
-            CFIndex len = CFStringGetMaximumSizeForEncoding(CFStringGetLength(cfstr), kCFStringEncodingUTF8);
-            char *name = (char *)SDL_malloc(len + 1);
-            bool usable = ((name != NULL) && (CFStringGetCString(cfstr, name, len + 1, kCFStringEncodingUTF8)));
-
-            CFRelease(cfstr);
-
-            if (usable) {
-                // Some devices have whitespace at the end...trim it.
-                len = (CFIndex) SDL_strlen(name);
-                while ((len > 0) && (name[len - 1] == ' ')) {
-                    len--;
-                }
-                usable = (len > 0);
-            }
-
-            if (usable) {
-                name[len] = '\0';
-
-                #if DEBUG_COREAUDIO
-                SDL_Log("COREAUDIO: Found %s device #%d: '%s' (devid %d)", ((recording) ? "recording" : "playback"), (int)i, name, (int)dev);
-                #endif
-                SDLCoreAudioHandle *newhandle = (SDLCoreAudioHandle *) SDL_calloc(1, sizeof (*newhandle));
-                if (newhandle) {
-                    newhandle->devid = dev;
-                    newhandle->recording = recording ? true : false;
-                    SDL_AudioDevice *device = SDL_AddAudioDevice(newhandle->recording, name, &spec, newhandle);
-                    if (device) {
-                        AudioObjectAddPropertyListener(dev, &alive_address, DeviceAliveNotification, device);
-                    } else {
-                        SDL_free(newhandle);
-                    }
-                }
-            }
-            SDL_free(name); // SDL_AddAudioDevice() would have copied the string.
+static void
+build_device_change_list(const char *name, SDL_AudioSpec *spec, const int iscapture, AudioDeviceID devId, void *data)
+{
+    AudioDeviceList **list = (AudioDeviceList **) data;
+    AudioDeviceList *item;
+    for (item = *list; item != NULL; item = item->next) {
+        if (item->devid == devId) {
+            item->alive = SDL_TRUE;
+            return;
         }
     }
 
-    SDL_small_free(devs, isstack);
+    add_to_internal_dev_list(iscapture, devId);  /* new device, add it. */
+    SDL_AddAudioDevice(iscapture, name, spec, (void *) ((size_t) devId));
 }
 
-// this is called when the system's list of available audio devices changes.
-static OSStatus DeviceListChangedNotification(AudioObjectID systemObj, UInt32 num_addr, const AudioObjectPropertyAddress *addrs, void *data)
+static void
+reprocess_device_list(const int iscapture, AudioDeviceList **list)
 {
-    RefreshPhysicalDevices();
-    return noErr;
-}
-
-static OSStatus DefaultAudioDeviceChangedNotification(const bool recording, AudioObjectID inObjectID, const AudioObjectPropertyAddress *addr)
-{
-    AudioDeviceID devid;
-    UInt32 size = sizeof(devid);
-    if (AudioObjectGetPropertyData(inObjectID, addr, 0, NULL, &size, &devid) == noErr) {
-        SDL_DefaultAudioDeviceChanged(FindCoreAudioDeviceByHandle(devid, recording));
+    AudioDeviceList *item;
+    AudioDeviceList *prev = NULL;
+    for (item = *list; item != NULL; item = item->next) {
+        item->alive = SDL_FALSE;
     }
-    return noErr;
+
+    build_device_list(iscapture, build_device_change_list, list);
+
+    /* free items in the list that aren't still alive. */
+    item = *list;
+    while (item != NULL) {
+        AudioDeviceList *next = item->next;
+        if (item->alive) {
+            prev = item;
+        } else {
+            SDL_RemoveAudioDevice(iscapture, (void *) ((size_t) item->devid));
+            if (prev) {
+                prev->next = item->next;
+            } else {
+                *list = item->next;
+            }
+            SDL_free(item);
+        }
+        item = next;
+    }
 }
 
-static OSStatus DefaultPlaybackDeviceChangedNotification(AudioObjectID inObjectID, UInt32 inNumberAddresses, const AudioObjectPropertyAddress *inAddresses, void *inUserData)
+/* this is called when the system's list of available audio devices changes. */
+static OSStatus
+device_list_changed(AudioObjectID systemObj, UInt32 num_addr, const AudioObjectPropertyAddress *addrs, void *data)
 {
-    #if DEBUG_COREAUDIO
-    SDL_Log("COREAUDIO: default playback device changed!");
-    #endif
-    SDL_assert(inNumberAddresses == 1);
-    return DefaultAudioDeviceChangedNotification(false, inObjectID, inAddresses);
+    reprocess_device_list(SDL_TRUE, &capture_devs);
+    reprocess_device_list(SDL_FALSE, &output_devs);
+    return 0;
 }
+#endif
 
-static OSStatus DefaultRecordingDeviceChangedNotification(AudioObjectID inObjectID, UInt32 inNumberAddresses, const AudioObjectPropertyAddress *inAddresses, void *inUserData)
+
+static int open_playback_devices;
+static int open_capture_devices;
+static int num_open_devices;
+static SDL_AudioDevice **open_devices;
+
+#if !MACOSX_COREAUDIO
+
+static BOOL session_active = NO;
+
+static void pause_audio_devices()
 {
-    #if DEBUG_COREAUDIO
-    SDL_Log("COREAUDIO: default recording device changed!");
-    #endif
-    SDL_assert(inNumberAddresses == 1);
-    return DefaultAudioDeviceChangedNotification(true, inObjectID, inAddresses);
-}
+    int i;
 
-static void COREAUDIO_DetectDevices(SDL_AudioDevice **default_playback, SDL_AudioDevice **default_recording)
-{
-    RefreshPhysicalDevices();
+    if (!open_devices) {
+        return;
+    }
 
-    AudioObjectAddPropertyListener(kAudioObjectSystemObject, &devlist_address, DeviceListChangedNotification, NULL);
-
-    // Get the Device ID
-    UInt32 size;
-    AudioDeviceID devid;
-
-    size = sizeof(AudioDeviceID);
-    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &default_playback_device_address, 0, NULL, &size, &devid) == noErr) {
-        SDL_AudioDevice *device = FindCoreAudioDeviceByHandle(devid, false);
-        if (device) {
-            *default_playback = device;
+    for (i = 0; i < num_open_devices; ++i) {
+        SDL_AudioDevice *device = open_devices[i];
+        if (device->hidden->audioQueue && !device->hidden->interrupted) {
+            AudioQueuePause(device->hidden->audioQueue);
         }
     }
-    AudioObjectAddPropertyListener(kAudioObjectSystemObject, &default_playback_device_address, DefaultPlaybackDeviceChangedNotification, NULL);
+}
 
-    size = sizeof(AudioDeviceID);
-    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &default_recording_device_address, 0, NULL, &size, &devid) == noErr) {
-        SDL_AudioDevice *device = FindCoreAudioDeviceByHandle(devid, true);
-        if (device) {
-            *default_recording = device;
+static void resume_audio_devices()
+{
+    int i;
+
+    if (!open_devices) {
+        return;
+    }
+
+    for (i = 0; i < num_open_devices; ++i) {
+        SDL_AudioDevice *device = open_devices[i];
+        if (device->hidden->audioQueue && !device->hidden->interrupted) {
+            AudioQueueStart(device->hidden->audioQueue, NULL);
         }
     }
-    AudioObjectAddPropertyListener(kAudioObjectSystemObject, &default_recording_device_address, DefaultRecordingDeviceChangedNotification, NULL);
 }
 
-#else  // iOS-specific section follows.
-
-static bool session_active = false;
-
-static bool PauseOneAudioDevice(SDL_AudioDevice *device, void *userdata)
+static void interruption_begin(_THIS)
 {
-    if (device->hidden && device->hidden->audioQueue && !device->hidden->interrupted) {
-        AudioQueuePause(device->hidden->audioQueue);
-    }
-    return false;  // keep enumerating devices until we've paused them all.
-}
-
-static void PauseAudioDevices(void)
-{
-    (void) SDL_FindPhysicalAudioDeviceByCallback(PauseOneAudioDevice, NULL);
-}
-
-static bool ResumeOneAudioDevice(SDL_AudioDevice *device, void *userdata)
-{
-    if (device->hidden && device->hidden->audioQueue && !device->hidden->interrupted) {
-        AudioQueueStart(device->hidden->audioQueue, NULL);
-    }
-    return false;  // keep enumerating devices until we've resumed them all.
-}
-
-static void ResumeAudioDevices(void)
-{
-    (void) SDL_FindPhysicalAudioDeviceByCallback(ResumeOneAudioDevice, NULL);
-}
-
-static void InterruptionBegin(SDL_AudioDevice *device)
-{
-    if (device != NULL && device->hidden->audioQueue != NULL) {
-        device->hidden->interrupted = true;
-        AudioQueuePause(device->hidden->audioQueue);
+    if (this != NULL && this->hidden->audioQueue != NULL) {
+        this->hidden->interrupted = SDL_TRUE;
+        AudioQueuePause(this->hidden->audioQueue);
     }
 }
 
-static void InterruptionEnd(SDL_AudioDevice *device)
+static void interruption_end(_THIS)
 {
-    if (device != NULL && device->hidden != NULL && device->hidden->audioQueue != NULL && device->hidden->interrupted && AudioQueueStart(device->hidden->audioQueue, NULL) == AVAudioSessionErrorCodeNone) {
-        device->hidden->interrupted = false;
+    if (this != NULL && this->hidden != NULL && this->hidden->audioQueue != NULL
+    && this->hidden->interrupted
+    && AudioQueueStart(this->hidden->audioQueue, NULL) == AVAudioSessionErrorCodeNone) {
+        this->hidden->interrupted = SDL_FALSE;
     }
 }
 
 @interface SDLInterruptionListener : NSObject
 
-@property(nonatomic, assign) SDL_AudioDevice *device;
+@property (nonatomic, assign) SDL_AudioDevice *device;
 
 @end
 
@@ -364,45 +356,26 @@ static void InterruptionEnd(SDL_AudioDevice *device)
 
 - (void)audioSessionInterruption:(NSNotification *)note
 {
-    @synchronized(self) {
+    @synchronized (self) {
         NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
         if (type.unsignedIntegerValue == AVAudioSessionInterruptionTypeBegan) {
-            InterruptionBegin(self.device);
+            interruption_begin(self.device);
         } else {
-            InterruptionEnd(self.device);
+            interruption_end(self.device);
         }
     }
 }
 
 - (void)applicationBecameActive:(NSNotification *)note
 {
-    @synchronized(self) {
-        InterruptionEnd(self.device);
+    @synchronized (self) {
+        interruption_end(self.device);
     }
 }
 
 @end
 
-typedef struct
-{
-    int playback;
-    int recording;
-} CountOpenAudioDevicesData;
-
-static bool CountOpenAudioDevices(SDL_AudioDevice *device, void *userdata)
-{
-    CountOpenAudioDevicesData *data = (CountOpenAudioDevicesData *) userdata;
-    if (device->hidden != NULL) {  // assume it's open if hidden != NULL
-        if (device->recording) {
-            data->recording++;
-        } else {
-            data->playback++;
-        }
-    }
-    return false;  // keep enumerating until all devices have been checked.
-}
-
-static bool UpdateAudioSession(SDL_AudioDevice *device, bool open, bool allow_playandrecord)
+static BOOL update_audio_session(_THIS, SDL_bool open, SDL_bool allow_playandrecord)
 {
     @autoreleasepool {
         AVAudioSession *session = [AVAudioSession sharedInstance];
@@ -414,14 +387,9 @@ static bool UpdateAudioSession(SDL_AudioDevice *device, bool open, bool allow_pl
         NSError *err = nil;
         const char *hint;
 
-        CountOpenAudioDevicesData data;
-        SDL_zero(data);
-        (void) SDL_FindPhysicalAudioDeviceByCallback(CountOpenAudioDevices, &data);
-
         hint = SDL_GetHint(SDL_HINT_AUDIO_CATEGORY);
         if (hint) {
-            if (SDL_strcasecmp(hint, "AVAudioSessionCategoryAmbient") == 0 ||
-                SDL_strcasecmp(hint, "ambient") == 0) {
+            if (SDL_strcasecmp(hint, "AVAudioSessionCategoryAmbient") == 0) {
                 category = AVAudioSessionCategoryAmbient;
             } else if (SDL_strcasecmp(hint, "AVAudioSessionCategorySoloAmbient") == 0) {
                 category = AVAudioSessionCategorySoloAmbient;
@@ -436,28 +404,23 @@ static bool UpdateAudioSession(SDL_AudioDevice *device, bool open, bool allow_pl
                     category = AVAudioSessionCategoryPlayAndRecord;
                 }
             }
-        } else if (data.playback && data.recording) {
-            if (allow_playandrecord) {
-                category = AVAudioSessionCategoryPlayAndRecord;
-            } else {
-                // We already failed play and record with AVAudioSessionErrorCodeResourceNotAvailable
-                return false;
-            }
-        } else if (data.recording) {
+        } else if (open_playback_devices && open_capture_devices) {
+            category = AVAudioSessionCategoryPlayAndRecord;
+        } else if (open_capture_devices) {
             category = AVAudioSessionCategoryRecord;
         }
 
-        #ifndef SDL_PLATFORM_TVOS
+#if !TARGET_OS_TV
         if (category == AVAudioSessionCategoryPlayAndRecord) {
             options |= AVAudioSessionCategoryOptionDefaultToSpeaker;
         }
-        #endif
+#endif
         if (category == AVAudioSessionCategoryRecord ||
             category == AVAudioSessionCategoryPlayAndRecord) {
             /* AVAudioSessionCategoryOptionAllowBluetooth isn't available in the SDK for
                Apple TV but is still needed in order to output to Bluetooth devices.
              */
-            options |= 0x4; // AVAudioSessionCategoryOptionAllowBluetooth;
+            options |= 0x4; /* AVAudioSessionCategoryOptionAllowBluetooth; */
         }
         if (category == AVAudioSessionCategoryPlayAndRecord) {
             options |= AVAudioSessionCategoryOptionAllowBluetoothA2DP |
@@ -468,44 +431,56 @@ static bool UpdateAudioSession(SDL_AudioDevice *device, bool open, bool allow_pl
             options |= AVAudioSessionCategoryOptionDuckOthers;
         }
 
-        if (![session.category isEqualToString:category] || session.categoryOptions != options) {
-            // Stop the current session so we don't interrupt other application audio
-            PauseAudioDevices();
-            [session setActive:NO error:nil];
-            session_active = false;
+        if ([session respondsToSelector:@selector(setCategory:mode:options:error:)]) {
+            if (![session.category isEqualToString:category] || session.categoryOptions != options) {
+                /* Stop the current session so we don't interrupt other application audio */
+                pause_audio_devices();
+                [session setActive:NO error:nil];
+                session_active = NO;
 
-            if (![session setCategory:category mode:mode options:options error:&err]) {
-                NSString *desc = err.description;
-                SDL_SetError("Could not set Audio Session category: %s", desc.UTF8String);
-                return false;
+                if (![session setCategory:category mode:mode options:options error:&err]) {
+                    NSString *desc = err.description;
+                    SDL_SetError("Could not set Audio Session category: %s", desc.UTF8String);
+                    return NO;
+                }
+            }
+        } else {
+            if (![session.category isEqualToString:category]) {
+                /* Stop the current session so we don't interrupt other application audio */
+                pause_audio_devices();
+                [session setActive:NO error:nil];
+                session_active = NO;
+
+                if (![session setCategory:category error:&err]) {
+                    NSString *desc = err.description;
+                    SDL_SetError("Could not set Audio Session category: %s", desc.UTF8String);
+                    return NO;
+                }
             }
         }
 
-        if ((data.playback || data.recording) && !session_active) {
+        if ((open_playback_devices || open_capture_devices) && !session_active) {
             if (![session setActive:YES error:&err]) {
                 if ([err code] == AVAudioSessionErrorCodeResourceNotAvailable &&
                     category == AVAudioSessionCategoryPlayAndRecord) {
-                    if (UpdateAudioSession(device, open, false)) {
-                        return true;
-                    } else {
-                        return SDL_SetError("Could not activate Audio Session: Resource not available");
-                    }
+                    return update_audio_session(this, open, SDL_FALSE);
                 }
 
                 NSString *desc = err.description;
-                return SDL_SetError("Could not activate Audio Session: %s", desc.UTF8String);
+                SDL_SetError("Could not activate Audio Session: %s", desc.UTF8String);
+                return NO;
             }
-            session_active = true;
-            ResumeAudioDevices();
-        } else if (!data.playback && !data.recording && session_active) {
-            PauseAudioDevices();
+            session_active = YES;
+            resume_audio_devices();
+        } else if (!open_playback_devices && !open_capture_devices && session_active) {
+            pause_audio_devices();
             [session setActive:NO error:nil];
-            session_active = false;
+            session_active = NO;
         }
 
         if (open) {
             SDLInterruptionListener *listener = [SDLInterruptionListener new];
-            listener.device = device;
+            listener.device = this;
 
             [center addObserver:listener
                        selector:@selector(audioSessionInterruption:)
@@ -515,7 +490,7 @@ static bool UpdateAudioSession(SDL_AudioDevice *device, bool open, bool allow_pl
             /* An interruption end notification is not guaranteed to be sent if
              we were previously interrupted... resuming if needed when the app
              becomes active seems to be the way to go. */
-            // Note: object: below needs to be nil, as otherwise it filters by the object, and session doesn't send foreground / active notifications.
+            // Note: object: below needs to be nil, as otherwise it filters by the object, and session doesn't send foreground / active notifications.  johna
             [center addObserver:listener
                        selector:@selector(applicationBecameActive:)
                            name:UIApplicationDidBecomeActiveNotification
@@ -526,516 +501,683 @@ static bool UpdateAudioSession(SDL_AudioDevice *device, bool open, bool allow_pl
                            name:UIApplicationWillEnterForegroundNotification
                          object:nil];
 
-            device->hidden->interruption_listener = CFBridgingRetain(listener);
+            this->hidden->interruption_listener = CFBridgingRetain(listener);
         } else {
             SDLInterruptionListener *listener = nil;
-            listener = (SDLInterruptionListener *)CFBridgingRelease(device->hidden->interruption_listener);
+            listener = (SDLInterruptionListener *) CFBridgingRelease(this->hidden->interruption_listener);
             [center removeObserver:listener];
-            @synchronized(listener) {
+            @synchronized (listener) {
                 listener.device = NULL;
             }
         }
     }
 
-    return true;
+    return YES;
 }
 #endif
 
 
-static bool COREAUDIO_PlayDevice(SDL_AudioDevice *device, const Uint8 *buffer, int buffer_size)
+/* The AudioQueue callback */
+static void
+outputCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer)
 {
-    AudioQueueBufferRef current_buffer = device->hidden->current_buffer;
-    SDL_assert(current_buffer != NULL);  // should have been called from PlaybackBufferReadyCallback
-    SDL_assert(buffer == (Uint8 *) current_buffer->mAudioData);
-    current_buffer->mAudioDataByteSize = current_buffer->mAudioDataBytesCapacity;
-    device->hidden->current_buffer = NULL;
-    AudioQueueEnqueueBuffer(device->hidden->audioQueue, current_buffer, 0, NULL);
-    return true;
-}
-
-static Uint8 *COREAUDIO_GetDeviceBuf(SDL_AudioDevice *device, int *buffer_size)
-{
-    AudioQueueBufferRef current_buffer = device->hidden->current_buffer;
-    SDL_assert(current_buffer != NULL);  // should have been called from PlaybackBufferReadyCallback
-    SDL_assert(current_buffer->mAudioData != NULL);
-    *buffer_size = (int) current_buffer->mAudioDataBytesCapacity;
-    return (Uint8 *) current_buffer->mAudioData;
-}
-
-static void PlaybackBufferReadyCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer)
-{
-    SDL_AudioDevice *device = (SDL_AudioDevice *)inUserData;
-    SDL_assert(inBuffer != NULL);  // ...right?
-    SDL_assert(device->hidden->current_buffer == NULL);  // shouldn't have anything pending
-    device->hidden->current_buffer = inBuffer;
-    const bool okay = SDL_PlaybackAudioThreadIterate(device);
-    SDL_assert((device->hidden->current_buffer == NULL) || !okay);  // PlayDevice should have enqueued and cleaned it out, unless we failed or shutdown.
-
-    // buffer is unexpectedly here? We're probably dying, but try to requeue this buffer with silence.
-    if (device->hidden->current_buffer) {
-        AudioQueueBufferRef current_buffer = device->hidden->current_buffer;
-        device->hidden->current_buffer = NULL;
-        SDL_memset(current_buffer->mAudioData, device->silence_value, (size_t) current_buffer->mAudioDataBytesCapacity);
-        AudioQueueEnqueueBuffer(device->hidden->audioQueue, current_buffer, 0, NULL);
-    }
-}
-
-static int COREAUDIO_RecordDevice(SDL_AudioDevice *device, void *buffer, int buflen)
-{
-    AudioQueueBufferRef current_buffer = device->hidden->current_buffer;
-    SDL_assert(current_buffer != NULL);  // should have been called from RecordingBufferReadyCallback
-    SDL_assert(current_buffer->mAudioData != NULL);
-    SDL_assert(buflen >= (int) current_buffer->mAudioDataByteSize);  // `cpy` makes sure this won't overflow a buffer, but we _will_ drop samples if this assertion fails!
-    const int cpy = SDL_min(buflen, (int) current_buffer->mAudioDataByteSize);
-    SDL_memcpy(buffer, current_buffer->mAudioData, cpy);
-    device->hidden->current_buffer = NULL;
-    AudioQueueEnqueueBuffer(device->hidden->audioQueue, current_buffer, 0, NULL);  // requeue for capturing more data later.
-    return cpy;
-}
-
-static void COREAUDIO_FlushRecording(SDL_AudioDevice *device)
-{
-    AudioQueueBufferRef current_buffer = device->hidden->current_buffer;
-    if (current_buffer != NULL) {  // also gets called at shutdown, when no buffer is available.
-        // just requeue the current buffer without reading from it, so it can be refilled with new data later.
-        device->hidden->current_buffer = NULL;
-        AudioQueueEnqueueBuffer(device->hidden->audioQueue, current_buffer, 0, NULL);
-    }
-}
-
-static void RecordingBufferReadyCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer,
-                          const AudioTimeStamp *inStartTime, UInt32 inNumberPacketDescriptions,
-                          const AudioStreamPacketDescription *inPacketDescs)
-{
-    SDL_AudioDevice *device = (SDL_AudioDevice *)inUserData;
-    SDL_assert(inAQ == device->hidden->audioQueue);
-    SDL_assert(inBuffer != NULL);  // ...right?
-    SDL_assert(device->hidden->current_buffer == NULL);  // shouldn't have anything pending
-    device->hidden->current_buffer = inBuffer;
-    SDL_RecordingAudioThreadIterate(device);
-
-    // buffer is unexpectedly here? We're probably dying, but try to requeue this buffer anyhow.
-    if (device->hidden->current_buffer != NULL) {
-        SDL_assert(SDL_GetAtomicInt(&device->shutdown) != 0);
-        COREAUDIO_FlushRecording(device);  // just flush it manually, which will requeue it.
-    }
-}
-
-static void COREAUDIO_CloseDevice(SDL_AudioDevice *device)
-{
-    if (!device->hidden) {
-        return;
+    SDL_AudioDevice *this = (SDL_AudioDevice *) inUserData;
+    if (SDL_AtomicGet(&this->hidden->shutdown)) {
+        return;  /* don't do anything. */
     }
 
-    // dispose of the audio queue before waiting on the thread, or it might stall for a long time!
-    if (device->hidden->audioQueue) {
-        AudioQueueFlush(device->hidden->audioQueue);
-        AudioQueueStop(device->hidden->audioQueue, 0);
-        AudioQueueDispose(device->hidden->audioQueue, 0);
-    }
+    if (!SDL_AtomicGet(&this->enabled) || SDL_AtomicGet(&this->paused)) {
+        /* Supply silence if audio is not enabled or paused */
+        SDL_memset(inBuffer->mAudioData, this->spec.silence, inBuffer->mAudioDataBytesCapacity);
+    } else if (this->stream) {
+        UInt32 remaining = inBuffer->mAudioDataBytesCapacity;
+        Uint8 *ptr = (Uint8 *) inBuffer->mAudioData;
 
-    if (device->hidden->thread) {
-        SDL_assert(SDL_GetAtomicInt(&device->shutdown) != 0); // should have been set by SDL_audio.c
-        SDL_WaitThread(device->hidden->thread, NULL);
-    }
-
-    #ifndef MACOSX_COREAUDIO
-    UpdateAudioSession(device, false, true);
-    #endif
-
-    if (device->hidden->ready_semaphore) {
-        SDL_DestroySemaphore(device->hidden->ready_semaphore);
-    }
-
-    // AudioQueueDispose() frees the actual buffer objects.
-    SDL_free(device->hidden->audioBuffer);
-    SDL_free(device->hidden->thread_error);
-    SDL_free(device->hidden);
-}
-
-#ifdef MACOSX_COREAUDIO
-static bool PrepareDevice(SDL_AudioDevice *device)
-{
-    SDL_assert(device->handle != NULL);  // this meant "system default" in SDL2, but doesn't anymore
-
-    const SDLCoreAudioHandle *handle = (const SDLCoreAudioHandle *) device->handle;
-    const AudioDeviceID devid = handle->devid;
-    OSStatus result = noErr;
-    UInt32 size = 0;
-
-    AudioObjectPropertyAddress addr = {
-        0,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
-
-    UInt32 alive = 0;
-    size = sizeof(alive);
-    addr.mSelector = kAudioDevicePropertyDeviceIsAlive;
-    addr.mScope = device->recording ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput;
-    result = AudioObjectGetPropertyData(devid, &addr, 0, NULL, &size, &alive);
-    CHECK_RESULT("AudioDeviceGetProperty (kAudioDevicePropertyDeviceIsAlive)");
-    if (!alive) {
-        return SDL_SetError("CoreAudio: requested device exists, but isn't alive.");
-    }
-
-    // some devices don't support this property, so errors are fine here.
-    pid_t pid = 0;
-    size = sizeof(pid);
-    addr.mSelector = kAudioDevicePropertyHogMode;
-    result = AudioObjectGetPropertyData(devid, &addr, 0, NULL, &size, &pid);
-    if ((result == noErr) && (pid != -1)) {
-        return SDL_SetError("CoreAudio: requested device is being hogged.");
-    }
-
-    device->hidden->deviceID = devid;
-
-    return true;
-}
-
-static bool AssignDeviceToAudioQueue(SDL_AudioDevice *device)
-{
-    const AudioObjectPropertyAddress prop = {
-        kAudioDevicePropertyDeviceUID,
-        device->recording ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
-        kAudioObjectPropertyElementMain
-    };
-
-    OSStatus result;
-    CFStringRef devuid;
-    UInt32 devuidsize = sizeof(devuid);
-    result = AudioObjectGetPropertyData(device->hidden->deviceID, &prop, 0, NULL, &devuidsize, &devuid);
-    CHECK_RESULT("AudioObjectGetPropertyData (kAudioDevicePropertyDeviceUID)");
-    result = AudioQueueSetProperty(device->hidden->audioQueue, kAudioQueueProperty_CurrentDevice, &devuid, devuidsize);
-    CFRelease(devuid);  // Release devuid; we're done with it and AudioQueueSetProperty should have retained if it wants to keep it.
-    CHECK_RESULT("AudioQueueSetProperty (kAudioQueueProperty_CurrentDevice)");
-    return true;
-}
-#endif
-
-static bool PrepareAudioQueue(SDL_AudioDevice *device)
-{
-    const AudioStreamBasicDescription *strdesc = &device->hidden->strdesc;
-    const bool recording = device->recording;
-    OSStatus result;
-
-    SDL_assert(CFRunLoopGetCurrent() != NULL);
-
-    if (recording) {
-        result = AudioQueueNewInput(strdesc, RecordingBufferReadyCallback, device, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode, 0, &device->hidden->audioQueue);
-        CHECK_RESULT("AudioQueueNewInput");
-    } else {
-        result = AudioQueueNewOutput(strdesc, PlaybackBufferReadyCallback, device, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode, 0, &device->hidden->audioQueue);
-        CHECK_RESULT("AudioQueueNewOutput");
-    }
-
-    #ifdef MACOSX_COREAUDIO
-    if (!AssignDeviceToAudioQueue(device)) {
-        return false;
-    }
-    #endif
-
-    SDL_UpdatedAudioDeviceFormat(device);  // make sure this is correct.
-
-    // Set the channel layout for the audio queue
-    AudioChannelLayout layout;
-    SDL_zero(layout);
-    switch (device->spec.channels) {
-    case 1:
-        // a standard mono stream
-        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Mono;
-        break;
-    case 2:
-        // a standard stereo stream (L R) - implied playback
-        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
-        break;
-    case 3:
-        // L R LFE
-        layout.mChannelLayoutTag = kAudioChannelLayoutTag_DVD_4;
-        break;
-    case 4:
-        // front left, front right, back left, back right
-        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Quadraphonic;
-        break;
-    case 5:
-        // L R LFE Ls Rs
-        layout.mChannelLayoutTag = kAudioChannelLayoutTag_DVD_6;
-        break;
-    case 6:
-        //  L R C LFE Ls Rs
-        layout.mChannelLayoutTag = kAudioChannelLayoutTag_DVD_12;
-        break;
-    case 7:
-        if (@available(macOS 10.15, iOS 13.0, tvOS 13.0, *)) {
-            // L R C LFE Cs Ls Rs
-            layout.mChannelLayoutTag = kAudioChannelLayoutTag_WAVE_6_1;
-        } else {
-            // L R C LFE Ls Rs Cs
-            layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_6_1_A;
-
-            // Convert from SDL channel layout to kAudioChannelLayoutTag_MPEG_6_1_A
-            static const int swizzle_map[7] = {
-                0, 1, 2, 3, 6, 4, 5
-            };
-            device->chmap = SDL_ChannelMapDup(swizzle_map, SDL_arraysize(swizzle_map));
-            if (!device->chmap) {
-                return false;
+        while (remaining > 0) {
+            if (SDL_AudioStreamAvailable(this->stream) == 0) {
+                /* Generate the data */
+                SDL_LockMutex(this->mixer_lock);
+                (*this->callbackspec.callback)(this->callbackspec.userdata,
+                                               this->hidden->buffer, this->hidden->bufferSize);
+                SDL_UnlockMutex(this->mixer_lock);
+                this->hidden->bufferOffset = 0;
+                SDL_AudioStreamPut(this->stream, this->hidden->buffer, this->hidden->bufferSize);
+            }
+            if (SDL_AudioStreamAvailable(this->stream) > 0) {
+                int got;
+                UInt32 len = SDL_AudioStreamAvailable(this->stream);
+                if (len > remaining)
+                    len = remaining;
+                got = SDL_AudioStreamGet(this->stream, ptr, len);
+                SDL_assert((got < 0) || (got == len));
+                if (got != len) {
+                    SDL_memset(ptr, this->spec.silence, len);
+                }
+                ptr = ptr + len;
+                remaining -= len;
             }
         }
-        break;
-    case 8:
-        if (@available(macOS 10.15, iOS 13.0, tvOS 13.0, *)) {
-            // L R C LFE Rls Rrs Ls Rs
-            layout.mChannelLayoutTag = kAudioChannelLayoutTag_WAVE_7_1;
-        } else {
-            // L R C LFE Ls Rs Rls Rrs
-            layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_7_1_C;
+    } else {
+        UInt32 remaining = inBuffer->mAudioDataBytesCapacity;
+        Uint8 *ptr = (Uint8 *) inBuffer->mAudioData;
 
-            // Convert from SDL channel layout to kAudioChannelLayoutTag_MPEG_7_1_C
-            static const int swizzle_map[8] = {
-                0, 1, 2, 3, 6, 7, 4, 5
-            };
-            device->chmap = SDL_ChannelMapDup(swizzle_map, SDL_arraysize(swizzle_map));
-            if (!device->chmap) {
-                return false;
+        while (remaining > 0) {
+            UInt32 len;
+            if (this->hidden->bufferOffset >= this->hidden->bufferSize) {
+                /* Generate the data */
+                SDL_LockMutex(this->mixer_lock);
+                (*this->callbackspec.callback)(this->callbackspec.userdata,
+                            this->hidden->buffer, this->hidden->bufferSize);
+                SDL_UnlockMutex(this->mixer_lock);
+                this->hidden->bufferOffset = 0;
             }
+
+            len = this->hidden->bufferSize - this->hidden->bufferOffset;
+            if (len > remaining) {
+                len = remaining;
+            }
+            SDL_memcpy(ptr, (char *)this->hidden->buffer +
+                       this->hidden->bufferOffset, len);
+            ptr = ptr + len;
+            remaining -= len;
+            this->hidden->bufferOffset += len;
         }
-        break;
-    default:
-        return SDL_SetError("Unsupported audio channels");
-    }
-    if (layout.mChannelLayoutTag != 0) {
-        result = AudioQueueSetProperty(device->hidden->audioQueue, kAudioQueueProperty_ChannelLayout, &layout, sizeof(layout));
-        CHECK_RESULT("AudioQueueSetProperty(kAudioQueueProperty_ChannelLayout)");
     }
 
-    // Make sure we can feed the device a minimum amount of time
-    double MINIMUM_AUDIO_BUFFER_TIME_MS = 15.0;
-    #ifdef SDL_PLATFORM_IOS
-    if (SDL_floor(NSFoundationVersionNumber) <= NSFoundationVersionNumber_iOS_7_1) {
-        // Older iOS hardware, use 40 ms as a minimum time
-        MINIMUM_AUDIO_BUFFER_TIME_MS = 40.0;
-    }
-    #endif
+    AudioQueueEnqueueBuffer(this->hidden->audioQueue, inBuffer, 0, NULL);
 
-    // we use THREE audio buffers by default, unlike most things that would
-    // choose two alternating buffers, because it helps with issues on
-    // Bluetooth headsets when recording and playing at the same time.
-    // See conversation in #8192 for details.
-    int numAudioBuffers = 3;
-    const double msecs = (device->sample_frames / ((double)device->spec.freq)) * 1000.0;
-    if (msecs < MINIMUM_AUDIO_BUFFER_TIME_MS) { // use more buffers if we have a VERY small sample set.
-        numAudioBuffers = ((int)SDL_ceil(MINIMUM_AUDIO_BUFFER_TIME_MS / msecs) * 2);
-    }
-
-    device->hidden->numAudioBuffers = numAudioBuffers;
-    device->hidden->audioBuffer = SDL_calloc(numAudioBuffers, sizeof(AudioQueueBufferRef));
-    if (device->hidden->audioBuffer == NULL) {
-        return false;
-    }
-
-    #if DEBUG_COREAUDIO
-    SDL_Log("COREAUDIO: numAudioBuffers == %d", numAudioBuffers);
-    #endif
-
-    for (int i = 0; i < numAudioBuffers; i++) {
-        result = AudioQueueAllocateBuffer(device->hidden->audioQueue, device->buffer_size, &device->hidden->audioBuffer[i]);
-        CHECK_RESULT("AudioQueueAllocateBuffer");
-        SDL_memset(device->hidden->audioBuffer[i]->mAudioData, device->silence_value, device->hidden->audioBuffer[i]->mAudioDataBytesCapacity);
-        device->hidden->audioBuffer[i]->mAudioDataByteSize = device->hidden->audioBuffer[i]->mAudioDataBytesCapacity;
-        // !!! FIXME: should we use AudioQueueEnqueueBufferWithParameters and specify all frames be "trimmed" so these are immediately ready to refill with SDL callback data?
-        result = AudioQueueEnqueueBuffer(device->hidden->audioQueue, device->hidden->audioBuffer[i], 0, NULL);
-        CHECK_RESULT("AudioQueueEnqueueBuffer");
-    }
-
-    result = AudioQueueStart(device->hidden->audioQueue, NULL);
-    CHECK_RESULT("AudioQueueStart");
-
-    return true;  // We're running!
+    inBuffer->mAudioDataByteSize = inBuffer->mAudioDataBytesCapacity;
 }
 
-static int AudioQueueThreadEntry(void *arg)
+static void
+inputCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer,
+              const AudioTimeStamp *inStartTime, UInt32 inNumberPacketDescriptions,
+              const AudioStreamPacketDescription *inPacketDescs)
 {
-    SDL_AudioDevice *device = (SDL_AudioDevice *)arg;
+    SDL_AudioDevice *this = (SDL_AudioDevice *) inUserData;
 
-    if (device->recording) {
-        SDL_RecordingAudioThreadSetup(device);
-    } else {
-        SDL_PlaybackAudioThreadSetup(device);
+    if (SDL_AtomicGet(&this->shutdown)) {
+        return;  /* don't do anything. */
     }
 
-    if (!PrepareAudioQueue(device)) {
-        device->hidden->thread_error = SDL_strdup(SDL_GetError());
-        SDL_SignalSemaphore(device->hidden->ready_semaphore);
-        return 0;
+    /* ignore unless we're active. */
+    if (!SDL_AtomicGet(&this->paused) && SDL_AtomicGet(&this->enabled)) {
+        const Uint8 *ptr = (const Uint8 *) inBuffer->mAudioData;
+        UInt32 remaining = inBuffer->mAudioDataByteSize;
+        while (remaining > 0) {
+            UInt32 len = this->hidden->bufferSize - this->hidden->bufferOffset;
+            if (len > remaining) {
+                len = remaining;
+            }
+
+            SDL_memcpy((char *)this->hidden->buffer + this->hidden->bufferOffset, ptr, len);
+            ptr += len;
+            remaining -= len;
+            this->hidden->bufferOffset += len;
+
+            if (this->hidden->bufferOffset >= this->hidden->bufferSize) {
+                SDL_LockMutex(this->mixer_lock);
+                (*this->callbackspec.callback)(this->callbackspec.userdata, this->hidden->buffer, this->hidden->bufferSize);
+                SDL_UnlockMutex(this->mixer_lock);
+                this->hidden->bufferOffset = 0;
+            }
+        }
     }
 
-    // init was successful, alert parent thread and start running...
-    SDL_SignalSemaphore(device->hidden->ready_semaphore);
+    AudioQueueEnqueueBuffer(this->hidden->audioQueue, inBuffer, 0, NULL);
+}
 
-    // This would be WaitDevice/WaitRecordingDevice in the normal SDL audio thread, but we get *BufferReadyCallback calls here to know when to iterate.
-    while (!SDL_GetAtomicInt(&device->shutdown)) {
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.10, 1);
+
+#if MACOSX_COREAUDIO
+static const AudioObjectPropertyAddress alive_address =
+{
+    kAudioDevicePropertyDeviceIsAlive,
+    kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyElementMaster
+};
+
+static OSStatus
+device_unplugged(AudioObjectID devid, UInt32 num_addr, const AudioObjectPropertyAddress *addrs, void *data)
+{
+    SDL_AudioDevice *this = (SDL_AudioDevice *) data;
+    SDL_bool dead = SDL_FALSE;
+    UInt32 isAlive = 1;
+    UInt32 size = sizeof (isAlive);
+    OSStatus error;
+
+    if (!SDL_AtomicGet(&this->enabled)) {
+        return 0;  /* already known to be dead. */
     }
 
-    if (device->recording) {
-        SDL_RecordingAudioThreadShutdown(device);
-    } else {
-        // Drain off any pending playback.
-        const CFTimeInterval secs = (((CFTimeInterval)device->sample_frames) / ((CFTimeInterval)device->spec.freq)) * 2.0;
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, secs, 0);
-        SDL_PlaybackAudioThreadShutdown(device);
+    error = AudioObjectGetPropertyData(this->hidden->deviceID, &alive_address,
+                                       0, NULL, &size, &isAlive);
+
+    if (error == kAudioHardwareBadDeviceError) {
+        dead = SDL_TRUE;  /* device was unplugged. */
+    } else if ((error == kAudioHardwareNoError) && (!isAlive)) {
+        dead = SDL_TRUE;  /* device died in some other way. */
+    }
+
+    if (dead) {
+        SDL_OpenedAudioDeviceDisconnected(this);
     }
 
     return 0;
 }
 
-static bool COREAUDIO_OpenDevice(SDL_AudioDevice *device)
+/* macOS calls this when the default device changed (if we have a default device open). */
+static OSStatus
+default_device_changed(AudioObjectID inObjectID, UInt32 inNumberAddresses, const AudioObjectPropertyAddress *inAddresses, void *inUserData)
 {
-    // Initialize all variables that we clean on shutdown
-    device->hidden = (struct SDL_PrivateAudioData *)SDL_calloc(1, sizeof(*device->hidden));
-    if (device->hidden == NULL) {
-        return false;
+    SDL_AudioDevice *this = (SDL_AudioDevice *) inUserData;
+    #if DEBUG_COREAUDIO
+    printf("COREAUDIO: default device changed for SDL audio device %p!\n", this);
+    #endif
+    SDL_AtomicSet(&this->hidden->device_change_flag, 1);  /* let the audioqueue thread pick up on this when safe to do so. */
+    return noErr;
+}
+#endif
+
+static void
+COREAUDIO_CloseDevice(_THIS)
+{
+    const SDL_bool iscapture = this->iscapture;
+    int i;
+
+/* !!! FIXME: what does iOS do when a bluetooth audio device vanishes? Headphones unplugged? */
+/* !!! FIXME: (we only do a "default" device on iOS right now...can we do more?) */
+#if MACOSX_COREAUDIO
+    if (this->handle != NULL) {  /* we don't register this listener for default devices. */
+        AudioObjectRemovePropertyListener(this->hidden->deviceID, &alive_address, device_unplugged, this);
+    }
+#endif
+
+    if (iscapture) {
+        open_capture_devices--;
+    } else {
+        open_playback_devices--;
     }
 
-    #ifndef MACOSX_COREAUDIO
-    if (!UpdateAudioSession(device, true, true)) {
-        return false;
-    }
+#if !MACOSX_COREAUDIO
+    update_audio_session(this, SDL_FALSE, SDL_TRUE);
+#endif
 
-    // Stop CoreAudio from doing expensive audio rate conversion
-    @autoreleasepool {
-        AVAudioSession *session = [AVAudioSession sharedInstance];
-        [session setPreferredSampleRate:device->spec.freq error:nil];
-        device->spec.freq = (int)session.sampleRate;
-        #ifdef SDL_PLATFORM_TVOS
-        if (device->recording) {
-            [session setPreferredInputNumberOfChannels:device->spec.channels error:nil];
-            device->spec.channels = (int)session.preferredInputNumberOfChannels;
-        } else {
-            [session setPreferredOutputNumberOfChannels:device->spec.channels error:nil];
-            device->spec.channels = (int)session.preferredOutputNumberOfChannels;
+    for (i = 0; i < num_open_devices; ++i) {
+        if (open_devices[i] == this) {
+            --num_open_devices;
+            if (i < num_open_devices) {
+                SDL_memmove(&open_devices[i], &open_devices[i+1], sizeof(open_devices[i])*(num_open_devices - i));
+            }
+            break;
         }
-        #else
-        // Calling setPreferredOutputNumberOfChannels seems to break audio output on iOS
-        #endif // SDL_PLATFORM_TVOS
+    }
+    if (num_open_devices == 0) {
+        SDL_free(open_devices);
+        open_devices = NULL;
+    }
+
+    /* if callback fires again, feed silence; don't call into the app. */
+    SDL_AtomicSet(&this->paused, 1);
+
+    if (this->hidden->audioQueue) {
+        AudioQueueDispose(this->hidden->audioQueue, 1);
+    }
+
+    if (this->hidden->thread) {
+        SDL_AtomicSet(&this->hidden->shutdown, 1);
+        SDL_WaitThread(this->hidden->thread, NULL);
+    }
+
+    if (this->hidden->ready_semaphore) {
+        SDL_DestroySemaphore(this->hidden->ready_semaphore);
+    }
+
+    /* AudioQueueDispose() frees the actual buffer objects. */
+    SDL_free(this->hidden->audioBuffer);
+    SDL_free(this->hidden->thread_error);
+    SDL_free(this->hidden->buffer);
+    SDL_free(this->hidden);
+}
+
+#if MACOSX_COREAUDIO
+static int
+prepare_device(_THIS, void *handle, int iscapture)
+{
+    AudioDeviceID devid = (AudioDeviceID) ((size_t) handle);
+    OSStatus result = noErr;
+    UInt32 size = 0;
+    UInt32 alive = 0;
+    pid_t pid = 0;
+
+    AudioObjectPropertyAddress addr = {
+        0,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMaster
+    };
+
+    if (handle == NULL) {
+        size = sizeof (AudioDeviceID);
+        addr.mSelector =
+            ((iscapture) ? kAudioHardwarePropertyDefaultInputDevice :
+            kAudioHardwarePropertyDefaultOutputDevice);
+        result = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr,
+                                            0, NULL, &size, &devid);
+        CHECK_RESULT("AudioHardwareGetProperty (default device)");
+    }
+
+    addr.mSelector = kAudioDevicePropertyDeviceIsAlive;
+    addr.mScope = iscapture ? kAudioDevicePropertyScopeInput :
+                    kAudioDevicePropertyScopeOutput;
+
+    size = sizeof (alive);
+    result = AudioObjectGetPropertyData(devid, &addr, 0, NULL, &size, &alive);
+    CHECK_RESULT
+        ("AudioDeviceGetProperty (kAudioDevicePropertyDeviceIsAlive)");
+
+    if (!alive) {
+        SDL_SetError("CoreAudio: requested device exists, but isn't alive.");
+        return 0;
+    }
+
+    addr.mSelector = kAudioDevicePropertyHogMode;
+    size = sizeof (pid);
+    result = AudioObjectGetPropertyData(devid, &addr, 0, NULL, &size, &pid);
+
+    /* some devices don't support this property, so errors are fine here. */
+    if ((result == noErr) && (pid != -1)) {
+        SDL_SetError("CoreAudio: requested device is being hogged.");
+        return 0;
+    }
+
+    this->hidden->deviceID = devid;
+    return 1;
+}
+
+static int
+assign_device_to_audioqueue(_THIS)
+{
+    const AudioObjectPropertyAddress prop = {
+        kAudioDevicePropertyDeviceUID,
+        this->iscapture ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
+        kAudioObjectPropertyElementMaster
+    };
+
+    OSStatus result;
+    CFStringRef devuid;
+    UInt32 devuidsize = sizeof (devuid);
+    result = AudioObjectGetPropertyData(this->hidden->deviceID, &prop, 0, NULL, &devuidsize, &devuid);
+    CHECK_RESULT("AudioObjectGetPropertyData (kAudioDevicePropertyDeviceUID)");
+    result = AudioQueueSetProperty(this->hidden->audioQueue, kAudioQueueProperty_CurrentDevice, &devuid, devuidsize);
+    CHECK_RESULT("AudioQueueSetProperty (kAudioQueueProperty_CurrentDevice)");
+
+    return 1;
+}
+#endif
+
+static int
+prepare_audioqueue(_THIS)
+{
+    const AudioStreamBasicDescription *strdesc = &this->hidden->strdesc;
+    const int iscapture = this->iscapture;
+    OSStatus result;
+    int i;
+
+    SDL_assert(CFRunLoopGetCurrent() != NULL);
+
+    if (iscapture) {
+        result = AudioQueueNewInput(strdesc, inputCallback, this, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode, 0, &this->hidden->audioQueue);
+        CHECK_RESULT("AudioQueueNewInput");
+    } else {
+        result = AudioQueueNewOutput(strdesc, outputCallback, this, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode, 0, &this->hidden->audioQueue);
+        CHECK_RESULT("AudioQueueNewOutput");
+    }
+
+    #if MACOSX_COREAUDIO
+    if (!assign_device_to_audioqueue(this)) {
+        return 0;
+    }
+
+    /* only listen for unplugging on specific devices, not the default device, as that should
+       switch to a different device (or hang out silently if there _is_ no other device). */
+    if (this->handle != NULL) {
+        /* !!! FIXME: what does iOS do when a bluetooth audio device vanishes? Headphones unplugged? */
+        /* !!! FIXME: (we only do a "default" device on iOS right now...can we do more?) */
+        /* Fire a callback if the device stops being "alive" (disconnected, etc). */
+        /* If this fails, oh well, we won't notice a device had an extraordinary event take place. */
+        AudioObjectAddPropertyListener(this->hidden->deviceID, &alive_address, device_unplugged, this);
     }
     #endif
 
-    // Setup a AudioStreamBasicDescription with the requested format
-    AudioStreamBasicDescription *strdesc = &device->hidden->strdesc;
+    /* Calculate the final parameters for this audio specification */
+    SDL_CalculateAudioSpec(&this->spec);
+
+    /* Set the channel layout for the audio queue */
+    AudioChannelLayout layout;
+    SDL_zero(layout);
+    switch (this->spec.channels) {
+    case 1:
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Mono;
+        break;
+    case 2:
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
+        break;
+    case 3:
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_DVD_4;
+        break;
+    case 4:
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Quadraphonic;
+        break;
+    case 5:
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_5_0_A;
+        break;
+    case 6:
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_5_1_A;
+        break;
+    case 7:
+        /* FIXME: Need to move channel[4] (BC) to channel[6] */
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_6_1_A;
+        break;
+    case 8:
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_7_1_A;
+        break;
+    }
+    if (layout.mChannelLayoutTag != 0) {
+        result = AudioQueueSetProperty(this->hidden->audioQueue, kAudioQueueProperty_ChannelLayout, &layout, sizeof(layout));
+        CHECK_RESULT("AudioQueueSetProperty(kAudioQueueProperty_ChannelLayout)");
+    }
+
+    /* Allocate a sample buffer */
+    this->hidden->bufferSize = this->spec.size;
+    this->hidden->bufferOffset = iscapture ? 0 : this->hidden->bufferSize;
+
+    this->hidden->buffer = SDL_malloc(this->hidden->bufferSize);
+    if (this->hidden->buffer == NULL) {
+        SDL_OutOfMemory();
+        return 0;
+    }
+
+    /* Make sure we can feed the device a minimum amount of time */
+    double MINIMUM_AUDIO_BUFFER_TIME_MS = 15.0;
+#if defined(__IPHONEOS__)
+    if (floor(NSFoundationVersionNumber) <= NSFoundationVersionNumber_iOS_7_1) {
+        /* Older iOS hardware, use 40 ms as a minimum time */
+        MINIMUM_AUDIO_BUFFER_TIME_MS = 40.0;
+    }
+#endif
+    const double msecs = (this->spec.samples / ((double) this->spec.freq)) * 1000.0;
+    int numAudioBuffers = 2;
+    if (msecs < MINIMUM_AUDIO_BUFFER_TIME_MS) {  /* use more buffers if we have a VERY small sample set. */
+        numAudioBuffers = ((int)SDL_ceil(MINIMUM_AUDIO_BUFFER_TIME_MS / msecs) * 2);
+    }
+
+    this->hidden->numAudioBuffers = numAudioBuffers;
+    this->hidden->audioBuffer = SDL_calloc(1, sizeof (AudioQueueBufferRef) * numAudioBuffers);
+    if (this->hidden->audioBuffer == NULL) {
+        SDL_OutOfMemory();
+        return 0;
+    }
+
+#if DEBUG_COREAUDIO
+    printf("COREAUDIO: numAudioBuffers == %d\n", numAudioBuffers);
+#endif
+
+    for (i = 0; i < numAudioBuffers; i++) {
+        result = AudioQueueAllocateBuffer(this->hidden->audioQueue, this->spec.size, &this->hidden->audioBuffer[i]);
+        CHECK_RESULT("AudioQueueAllocateBuffer");
+        SDL_memset(this->hidden->audioBuffer[i]->mAudioData, this->spec.silence, this->hidden->audioBuffer[i]->mAudioDataBytesCapacity);
+        this->hidden->audioBuffer[i]->mAudioDataByteSize = this->hidden->audioBuffer[i]->mAudioDataBytesCapacity;
+        /* !!! FIXME: should we use AudioQueueEnqueueBufferWithParameters and specify all frames be "trimmed" so these are immediately ready to refill with SDL callback data? */
+        result = AudioQueueEnqueueBuffer(this->hidden->audioQueue, this->hidden->audioBuffer[i], 0, NULL);
+        CHECK_RESULT("AudioQueueEnqueueBuffer");
+    }
+
+    result = AudioQueueStart(this->hidden->audioQueue, NULL);
+    CHECK_RESULT("AudioQueueStart");
+
+    /* We're running! */
+    return 1;
+}
+
+static int
+audioqueue_thread(void *arg)
+{
+    SDL_AudioDevice *this = (SDL_AudioDevice *) arg;
+
+    #if MACOSX_COREAUDIO
+    const AudioObjectPropertyAddress default_device_address = {
+        this->iscapture ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMaster
+    };
+
+    if (this->handle == NULL) {  /* opened the default device? Register to know if the user picks a new default. */
+        /* we don't care if this fails; we just won't change to new default devices, but we still otherwise function in this case. */
+        AudioObjectAddPropertyListener(kAudioObjectSystemObject, &default_device_address, default_device_changed, this);
+    }
+    #endif
+
+    const int rc = prepare_audioqueue(this);
+    if (!rc) {
+        this->hidden->thread_error = SDL_strdup(SDL_GetError());
+        SDL_SemPost(this->hidden->ready_semaphore);
+        return 0;
+    }
+
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+
+    /* init was successful, alert parent thread and start running... */
+    SDL_SemPost(this->hidden->ready_semaphore);
+
+    while (!SDL_AtomicGet(&this->hidden->shutdown)) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.10, 1);
+
+        #if MACOSX_COREAUDIO
+        if ((this->handle == NULL) && SDL_AtomicGet(&this->hidden->device_change_flag)) {
+            SDL_AtomicSet(&this->hidden->device_change_flag, 0);
+
+            #if DEBUG_COREAUDIO
+            printf("COREAUDIO: audioqueue_thread is trying to switch to new default device!\n");
+            #endif
+
+            /* if any of this fails, there's not much to do but wait to see if the user gives up
+               and quits (flagging the audioqueue for shutdown), or toggles to some other system
+               output device (in which case we'll try again). */
+            const AudioDeviceID prev_devid = this->hidden->deviceID;
+            if (prepare_device(this, this->handle, this->iscapture) && (prev_devid != this->hidden->deviceID)) {
+                AudioQueueStop(this->hidden->audioQueue, 1);
+                if (assign_device_to_audioqueue(this)) {
+                    int i;
+                    for (i = 0; i < this->hidden->numAudioBuffers; i++) {
+                        SDL_memset(this->hidden->audioBuffer[i]->mAudioData, this->spec.silence, this->hidden->audioBuffer[i]->mAudioDataBytesCapacity);
+                        /* !!! FIXME: should we use AudioQueueEnqueueBufferWithParameters and specify all frames be "trimmed" so these are immediately ready to refill with SDL callback data? */
+                        AudioQueueEnqueueBuffer(this->hidden->audioQueue, this->hidden->audioBuffer[i], 0, NULL);
+                    }
+                    AudioQueueStart(this->hidden->audioQueue, NULL);
+                }
+            }
+        }
+        #endif
+    }
+
+    if (!this->iscapture) {  /* Drain off any pending playback. */
+        const CFTimeInterval secs = (((this->spec.size / (SDL_AUDIO_BITSIZE(this->spec.format) / 8)) / this->spec.channels) / ((CFTimeInterval) this->spec.freq)) * 2.0;
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, secs, 0);
+    }
+
+    #if MACOSX_COREAUDIO
+    if (this->handle == NULL) {
+        /* we don't care if this fails; we just won't change to new default devices, but we still otherwise function in this case. */
+        AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &default_device_address, default_device_changed, this);
+    }
+    #endif
+
+    return 0;
+}
+
+static int
+COREAUDIO_OpenDevice(_THIS, void *handle, const char *devname, int iscapture)
+{
+    AudioStreamBasicDescription *strdesc;
+    SDL_AudioFormat test_format = SDL_FirstAudioFormat(this->spec.format);
+    int valid_datatype = 0;
+    SDL_AudioDevice **new_open_devices;
+
+    /* Initialize all variables that we clean on shutdown */
+    this->hidden = (struct SDL_PrivateAudioData *)
+        SDL_malloc((sizeof *this->hidden));
+    if (this->hidden == NULL) {
+        return SDL_OutOfMemory();
+    }
+    SDL_zerop(this->hidden);
+
+    strdesc = &this->hidden->strdesc;
+
+    if (iscapture) {
+        open_capture_devices++;
+    } else {
+        open_playback_devices++;
+    }
+
+    new_open_devices = (SDL_AudioDevice **)SDL_realloc(open_devices, sizeof(open_devices[0]) * (num_open_devices + 1));
+    if (new_open_devices) {
+        open_devices = new_open_devices;
+        open_devices[num_open_devices++] = this;
+    }
+
+#if !MACOSX_COREAUDIO
+    if (!update_audio_session(this, SDL_TRUE, SDL_TRUE)) {
+        return -1;
+    }
+
+    /* Stop CoreAudio from doing expensive audio rate conversion */
+    @autoreleasepool {
+        AVAudioSession* session = [AVAudioSession sharedInstance];
+        [session setPreferredSampleRate:this->spec.freq error:nil];
+        this->spec.freq = (int)session.sampleRate;
+#if TARGET_OS_TV
+        if (iscapture) {
+            [session setPreferredInputNumberOfChannels:this->spec.channels error:nil];
+            this->spec.channels = session.preferredInputNumberOfChannels;
+        } else {
+            [session setPreferredOutputNumberOfChannels:this->spec.channels error:nil];
+            this->spec.channels = session.preferredOutputNumberOfChannels;
+        }
+#else
+        /* Calling setPreferredOutputNumberOfChannels seems to break audio output on iOS */
+#endif /* TARGET_OS_TV */
+    }
+#endif
+
+    /* Setup a AudioStreamBasicDescription with the requested format */
+    SDL_zerop(strdesc);
     strdesc->mFormatID = kAudioFormatLinearPCM;
     strdesc->mFormatFlags = kLinearPCMFormatFlagIsPacked;
-    strdesc->mChannelsPerFrame = device->spec.channels;
-    strdesc->mSampleRate = device->spec.freq;
+    strdesc->mChannelsPerFrame = this->spec.channels;
+    strdesc->mSampleRate = this->spec.freq;
     strdesc->mFramesPerPacket = 1;
 
-    const SDL_AudioFormat *closefmts = SDL_ClosestAudioFormats(device->spec.format);
-    SDL_AudioFormat test_format;
-    while ((test_format = *(closefmts++)) != 0) {
-        // CoreAudio handles most of SDL's formats natively.
+    while ((!valid_datatype) && (test_format)) {
+        this->spec.format = test_format;
+        /* CoreAudio handles most of SDL's formats natively, but not U16, apparently. */
         switch (test_format) {
-        case SDL_AUDIO_U8:
-        case SDL_AUDIO_S8:
-        case SDL_AUDIO_S16LE:
-        case SDL_AUDIO_S16BE:
-        case SDL_AUDIO_S32LE:
-        case SDL_AUDIO_S32BE:
-        case SDL_AUDIO_F32LE:
-        case SDL_AUDIO_F32BE:
+        case AUDIO_U8:
+        case AUDIO_S8:
+        case AUDIO_S16LSB:
+        case AUDIO_S16MSB:
+        case AUDIO_S32LSB:
+        case AUDIO_S32MSB:
+        case AUDIO_F32LSB:
+        case AUDIO_F32MSB:
+            valid_datatype = 1;
+            strdesc->mBitsPerChannel = SDL_AUDIO_BITSIZE(this->spec.format);
+            if (SDL_AUDIO_ISBIGENDIAN(this->spec.format))
+                strdesc->mFormatFlags |= kLinearPCMFormatFlagIsBigEndian;
+
+            if (SDL_AUDIO_ISFLOAT(this->spec.format))
+                strdesc->mFormatFlags |= kLinearPCMFormatFlagIsFloat;
+            else if (SDL_AUDIO_ISSIGNED(this->spec.format))
+                strdesc->mFormatFlags |= kLinearPCMFormatFlagIsSignedInteger;
             break;
 
         default:
-            continue;
+            test_format = SDL_NextAudioFormat();
+            break;
         }
-        break;
     }
 
-    if (!test_format) { // shouldn't happen, but just in case...
-        return SDL_SetError("%s: Unsupported audio format", "coreaudio");
-    }
-    device->spec.format = test_format;
-    strdesc->mBitsPerChannel = SDL_AUDIO_BITSIZE(test_format);
-    if (SDL_AUDIO_ISBIGENDIAN(test_format)) {
-        strdesc->mFormatFlags |= kLinearPCMFormatFlagIsBigEndian;
-    }
-
-    if (SDL_AUDIO_ISFLOAT(test_format)) {
-        strdesc->mFormatFlags |= kLinearPCMFormatFlagIsFloat;
-    } else if (SDL_AUDIO_ISSIGNED(test_format)) {
-        strdesc->mFormatFlags |= kLinearPCMFormatFlagIsSignedInteger;
+    if (!valid_datatype) {      /* shouldn't happen, but just in case... */
+        return SDL_SetError("Unsupported audio format");
     }
 
     strdesc->mBytesPerFrame = strdesc->mChannelsPerFrame * strdesc->mBitsPerChannel / 8;
     strdesc->mBytesPerPacket = strdesc->mBytesPerFrame * strdesc->mFramesPerPacket;
 
-#ifdef MACOSX_COREAUDIO
-    if (!PrepareDevice(device)) {
-        return false;
+#if MACOSX_COREAUDIO
+    if (!prepare_device(this, handle, iscapture)) {
+        return -1;
     }
 #endif
 
-    // This has to init in a new thread so it can get its own CFRunLoop. :/
-    device->hidden->ready_semaphore = SDL_CreateSemaphore(0);
-    if (!device->hidden->ready_semaphore) {
-        return false; // oh well.
+    /* This has to init in a new thread so it can get its own CFRunLoop. :/ */
+    SDL_AtomicSet(&this->hidden->shutdown, 0);
+    this->hidden->ready_semaphore = SDL_CreateSemaphore(0);
+    if (!this->hidden->ready_semaphore) {
+        return -1;  /* oh well. */
     }
 
-    char threadname[64];
-    SDL_GetAudioThreadName(device, threadname, sizeof(threadname));
-    device->hidden->thread = SDL_CreateThread(AudioQueueThreadEntry, threadname, device);
-    if (!device->hidden->thread) {
-        return false;
+    this->hidden->thread = SDL_CreateThreadInternal(audioqueue_thread, "AudioQueue thread", 512 * 1024, this);
+    if (!this->hidden->thread) {
+        return -1;
     }
 
-    SDL_WaitSemaphore(device->hidden->ready_semaphore);
-    SDL_DestroySemaphore(device->hidden->ready_semaphore);
-    device->hidden->ready_semaphore = NULL;
+    SDL_SemWait(this->hidden->ready_semaphore);
+    SDL_DestroySemaphore(this->hidden->ready_semaphore);
+    this->hidden->ready_semaphore = NULL;
 
-    if ((device->hidden->thread != NULL) && (device->hidden->thread_error != NULL)) {
-        SDL_WaitThread(device->hidden->thread, NULL);
-        device->hidden->thread = NULL;
-        return SDL_SetError("%s", device->hidden->thread_error);
+    if ((this->hidden->thread != NULL) && (this->hidden->thread_error != NULL)) {
+        SDL_SetError("%s", this->hidden->thread_error);
+        return -1;
     }
 
-    return (device->hidden->thread != NULL);
+    return (this->hidden->thread != NULL) ? 0 : -1;
 }
 
-static void COREAUDIO_DeinitializeStart(void)
+static void
+COREAUDIO_Deinitialize(void)
 {
-#ifdef MACOSX_COREAUDIO
-    AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &devlist_address, DeviceListChangedNotification, NULL);
-    AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &default_playback_device_address, DefaultPlaybackDeviceChangedNotification, NULL);
-    AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &default_recording_device_address, DefaultRecordingDeviceChangedNotification, NULL);
+#if MACOSX_COREAUDIO
+    AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &devlist_address, device_list_changed, NULL);
+    free_audio_device_list(&capture_devs);
+    free_audio_device_list(&output_devs);
 #endif
 }
 
-static bool COREAUDIO_Init(SDL_AudioDriverImpl *impl)
+static int
+COREAUDIO_Init(SDL_AudioDriverImpl * impl)
 {
+    /* Set the function pointers */
     impl->OpenDevice = COREAUDIO_OpenDevice;
-    impl->PlayDevice = COREAUDIO_PlayDevice;
-    impl->GetDeviceBuf = COREAUDIO_GetDeviceBuf;
-    impl->RecordDevice = COREAUDIO_RecordDevice;
-    impl->FlushRecording = COREAUDIO_FlushRecording;
     impl->CloseDevice = COREAUDIO_CloseDevice;
-    impl->DeinitializeStart = COREAUDIO_DeinitializeStart;
+    impl->Deinitialize = COREAUDIO_Deinitialize;
 
-#ifdef MACOSX_COREAUDIO
+#if MACOSX_COREAUDIO
     impl->DetectDevices = COREAUDIO_DetectDevices;
-    impl->FreeDeviceHandle = COREAUDIO_FreeDeviceHandle;
+    AudioObjectAddPropertyListener(kAudioObjectSystemObject, &devlist_address, device_list_changed, NULL);
 #else
-    impl->OnlyHasDefaultPlaybackDevice = true;
-    impl->OnlyHasDefaultRecordingDevice = true;
+    impl->OnlyHasDefaultOutputDevice = 1;
+    impl->OnlyHasDefaultCaptureDevice = 1;
 #endif
 
-    impl->ProvidesOwnCallbackThread = true;
-    impl->HasRecordingSupport = true;
+    impl->ProvidesOwnCallbackThread = 1;
+    impl->HasCaptureSupport = 1;
 
-    return true;
+    return 1;   /* this audio target is available. */
 }
 
 AudioBootStrap COREAUDIO_bootstrap = {
-    "coreaudio", "CoreAudio", COREAUDIO_Init, false, false
+    "coreaudio", "CoreAudio", COREAUDIO_Init, 0
 };
 
-#endif // SDL_AUDIO_DRIVER_COREAUDIO
+#endif /* SDL_AUDIO_DRIVER_COREAUDIO */
+
+/* vi: set ts=4 sw=4 expandtab: */
